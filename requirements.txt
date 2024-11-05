@@ -1,0 +1,5 @@
+Flask
+firebase-admin
+pydub
+whisper
+flask-cors
