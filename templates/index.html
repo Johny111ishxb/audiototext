@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio to Text Converter</title>
+    <link rel="stylesheet" href="style.css">
+<!-- Add the Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/9.21.0/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.21.0/firebase-auth.js"></script>
+    <style>
+        .profile-container {
+            position: relative;
+            display: inline-block;
+        }
+
+        #profile-pic {
+            cursor: pointer;
+            transition: opacity 0.3s;
+        }
+
+        #profile-pic:hover {
+            opacity: 0.8;
+        }
+
+        .profile-dropdown {
+            display: none;
+            position: absolute;
+            right: 0;
+            top: 60px;
+            background-color: white;
+            min-width: 200px;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            padding: 8px 0;
+            z-index: 1000;
+        }
+
+        .profile-dropdown.show {
+            display: block;
+        }
+
+        .profile-info {
+            padding: 12px 16px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .profile-info .user-name {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        .profile-info .user-email {
+            font-size: 0.9em;
+            color: #666;
+        }
+
+        .profile-dropdown button {
+            width: 100%;
+            padding: 12px 16px;
+            border: none;
+            background: none;
+            text-align: left;
+            cursor: pointer;
+            font-size: 1em;
+            color: #333;
+            transition: background-color 0.3s;
+        }
+
+        .profile-dropdown button:hover {
+            background-color: #f5f5f5;
+        }
+
+        .profile-dropdown button.logout {
+            color: #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo">Free remover</div>
+        <div class="mode-toggle" id="mode-toggle">☀️</div>
+        <button class="sign-up-btn" id="sign-up-btn">Sign Up</button>
+        
+        <!-- Updated profile section with dropdown -->
+        <div class="profile-container">
+            <img id="profile-pic" src="a.jpeg" alt="" style="display:none; width: 50px; height: 50px; border-radius: 50%;">
+            <div class="profile-dropdown" id="profile-dropdown">
+                <div class="profile-info">
+                    <div class="user-name" id="profile-name">User Name</div>
+                    <div class="user-email" id="profile-email">user@example.com</div>
+                </div>
+                <button class="logout" id="logout">Logout</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Rest of your HTML remains the same, but remove the logout button from the form -->
+    <div class="container">
+        <h1>Audio to Text <span>Converter</span></h1>
+        <form id="uploadForm" method="POST" enctype="multipart/form-data">
+            <input type="file" name="audio_file" accept="audio/*" required>
+            <select name="language" required>
+                <option value="en">English</option>
+                <option value="ar">Arabic</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="hi">Hindi</option>
+                <option value="ja">Japanese</option>
+                <option value="zh">Chinese</option>
+            </select>
+            <button class="submit" type="submit">Convert to Text</button>
+        </form>
+
+        <div class="loader"></div>
+
+        <div class="result">
+            <h2>Extracted Text:</h2>
+            <textarea id="textResult" rows="10" readonly></textarea>
+        </div>
+    </div>
+    <style>
+        * {
+            padding: 0;
+            margin: 0;
+            box-sizing: border-box;
+            list-style: none;
+            scroll-behavior: smooth;
+            text-decoration: none;
+        }
+
+        .sign-up-btn{
+            transform: translateX(30rem);
+            background-color: rgb(252, 252, 252);
+            border: none;
+            padding: 0.5rem;
+            font-size: 1.5rem;
+            border-radius: 5px;
+            cursor: pointer;
+            padding: 14px 40px;
+            font-weight: bold;
+            color: rgb(0, 0, 0);
+            border-radius: 30px;
+            position: relative;
+            overflow: hidden;
+            z-index: 1;
+            transition: color 0.4s ease;
+        }
+
+        .sign-up-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, #06ffb4, #01dd9b);
+            transition: left 0.4s ease;
+            border: none;
+            z-index: -1;
+        }
+
+        .sign-up-btn:hover {
+            background: #06ffb4;
+            color: white;
+        }
+
+        .sign-up-btn:hover::before {
+            left: 0;
+        }
+
+        .mode-toggle{
+           transform: translateX(12rem);
+           transition: transform 1s;
+           cursor: pointer;
+           font-size: 1.5rem;
+           position: fixed;
+        }
+
+        body.dark-mode header{
+            background-color: #222;
+            color: #fff;
+        }
+
+        body.dark-mode .sign-up-btn:hover::before {
+            left: 0;
+        }
+
+        body.dark-mode .sign-up-btn:hover{
+            border: none;
+            background: violet;
+        }
+
+        body.dark-mode .sign-up-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, violet, rgb(241, 66, 241));
+            transition: left 0.4s ease;
+            border: none;
+            z-index: -1;
+        }
+
+        body.dark-mode .loader{
+            --c: no-repeat linear-gradient(violet 0 0);
+        }
+
+        body.dark-mode{
+            background-color: #222;
+            color: #fff;
+        }
+
+        body.dark-mode .container{
+            background-color: #222;
+            color: #fff;
+        }
+
+        body.dark-mode h1{
+            background-color: #222222;
+            color: #fff;
+        }
+
+        body.dark-mode span{
+            color: rgb(255, 9, 222);
+        }
+
+        body.dark-mode .submit{
+            background-color: rgb(255, 9, 222);
+        }
+
+        body.dark-mode textarea {
+            background-color: #222;
+            color: white;
+            border: 1px solid rgb(255, 9, 222);
+        }
+
+        .loader {
+            width: 45px;
+            aspect-ratio: .75;
+            --c: no-repeat linear-gradient(#000 0 0);
+            background: 
+                var(--c) 0%   50%,
+                var(--c) 50%  50%,
+                var(--c) 100% 50%;
+            animation: l7 1s infinite linear alternate;
+            display: none;
+            margin: 20px auto;
+        }
+
+        @keyframes l7 {
+            0%  {background-size: 20% 50% ,20% 50% ,20% 50% }
+            20% {background-size: 20% 20% ,20% 50% ,20% 50% }
+            40% {background-size: 20% 100%,20% 20% ,20% 50% }
+            60% {background-size: 20% 50% ,20% 100%,20% 20% }
+            80% {background-size: 20% 50% ,20% 50% ,20% 100%}
+            100%{background-size: 20% 50% ,20% 50% ,20% 50% }
+        }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+
+        .logo{
+            font-size: 2rem;
+        }
+
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.288);
+            text-align: center;
+            transform: translateY(3rem);
+        }
+
+        span {
+            color: #34ddc7;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+        }
+
+        input[type="file"],
+        select {
+            display: block;
+            margin: 20px auto;
+        }
+
+        .submit{
+            padding: 10px 15px;
+            font-size: 20px;
+            color: white;
+            background-color: rgb(0, 240, 200);
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.4s;
+        }
+
+        button:hover {
+            background-color: rgb(0, 0, 0);
+        }
+
+        .result {
+            margin-top: 30px;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #15f7c6;
+            font-family: 'Courier New', monospace;
+            resize: vertical;
+            line-height: 1.4;
+        }
+
+        textarea:focus{
+            border: 1px solid #f71515;
+        }
+
+        header {
+            width: 100%;
+            padding: 10px 20px;
+            background-color: #fff;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 1000;
+        }
+
+        footer{
+            font-size: 1.2rem;
+            transform: translateY(9rem);
+        }
+
+        img{
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+        }
+
+        img:hover{
+            border: 2px solid #15f7c6;
+        }
+    </style>
+     <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js';
+        import { getAuth, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js';
+
+        // Firebase configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyBk24eVfBQoPQ8Adiw9mA2sS_tpzwJ-ksk",
+            authDomain: "imagetotext-4c3e3.firebaseapp.com",
+            projectId: "imagetotext-4c3e3",
+            storageBucket: "imagetotext-4c3e3.appspot.com",
+            messagingSenderId: "643977043225",
+            appId: "1:643977043225:web:9d648f58d7098a0c78f988",
+            measurementId: "G-XRQFS9KGR0"
+        };
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+
+        // Get current auth token
+        async function getCurrentToken() {
+            const user = auth.currentUser;
+            if (user) {
+                return user.getIdToken();
+            }
+            return null;
+        }
+
+        const form = document.getElementById('uploadForm');
+        const loader = document.querySelector('.loader');
+        const textResult = document.getElementById('textResult');
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function typeWriter(text) {
+            textResult.value = '';
+            let textContent = '';
+            const cursor = '\u2588';
+            
+            for (let i = 0; i < text.length; i++) {
+                textContent += text[i];
+                textResult.value = textContent + cursor;
+                textResult.scrollTop = textResult.scrollHeight;
+                const delay = Math.random() * 30 + 20;
+                await sleep(delay);
+            }
+            
+            textResult.value = textContent;
+        }
+
+        // Add auth state observer
+        onAuthStateChanged(auth, (user) => {
+            if (!user) {
+                window.location.href = '/login';
+            }
+        });
+
+        if (form) {
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+
+                loader.style.display = 'block';
+                textResult.value = '';
+
+                const formData = new FormData(form);
+
+                try {
+                    const token = await getCurrentToken();
+                    if (!token) {
+                        throw new Error('Not authenticated');
+                    }
+
+                    const response = await fetch('http://127.0.0.1:8000/upload', {
+                        method: 'POST',
+                        body: formData,
+                        headers: {
+                            'Authorization': `Bearer ${token}`
+                        },
+                        credentials: 'include'
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        loader.style.display = 'none';
+                        if (data.transcription) {
+                            await typeWriter(data.transcription);
+                        } else {
+                            await typeWriter("No transcription data received.");
+                        }
+                    } else {
+                        loader.style.display = 'none';
+                        const errorData = await response.json();
+                        await typeWriter("Error: " + (errorData.error || response.statusText));
+                    }
+                } catch (error) {
+                    console.error("Error fetching data: ", error);
+                    loader.style.display = 'none';
+                    await typeWriter("Error processing audio. Please try again.");
+                }
+            });
+        }
+
+        const modeToggle = document.getElementById('mode-toggle');
+        if (modeToggle) {
+            modeToggle.addEventListener('click', () => {
+                document.body.classList.toggle('dark-mode');
+                document.body.classList.toggle('light-mode');
+                if (document.body.classList.contains('dark-mode')) {
+                    modeToggle.innerHTML = '🌙';
+                } else {
+                    modeToggle.innerHTML = '☀️';
+                }
+            });
+        }
+    </script>
+
+    <!-- Update path to firebaseauth.js -->
+    <script type="module" src="{{ url_for('static', filename='firebaseauth.js') }}"></script>
+</body>
+</html>
