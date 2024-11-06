@@ -1,11 +1,9 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory, session, redirect, url_for
+import os
+import secrets
 import time
+from flask import Flask, render_template, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
 from functools import wraps
-import os
-import io
-import json
-import secrets
 import firebase_admin
 from firebase_admin import credentials, auth, storage, firestore
 from pydub import AudioSegment
@@ -13,14 +11,14 @@ import whisper
 import tempfile
 
 # Initialize Flask app
-app = Flask(__name__, static_folder='static')
-app.secret_key = secrets.token_hex(24)
+app = Flask(__name__, static_folder='static', template_folder='templates')
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 CORS(app, supports_credentials=True)
 
 # Initialize Firebase Admin SDK
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
-    'storageBucket': 'imagetotext-4c3e3.appspot.com'
+    'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
 })
 
 # Initialize Firestore
@@ -204,5 +202,4 @@ def upload_audio():
         }), 500
 
 if __name__ == '__main__':
-    print(f"Generated secret key: {app.secret_key}")
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)), debug=False)
