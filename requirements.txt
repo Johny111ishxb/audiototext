@@ -3,4 +3,5 @@ flask-cors==3.0.10
 firebase-admin==5.3.0
 pydub==0.25.1
 whisper==1.1
+werkzeug==2.0.3
 torch==2.0.1  # Replace with the most recent version supported by the platform
