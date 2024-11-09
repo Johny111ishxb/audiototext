@@ -21,9 +21,12 @@ COPY . .
 # Set environment variables
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
+ENV GUNICORN_TIMEOUT=300
+ENV GUNICORN_WORKERS=1
+ENV GUNICORN_THREADS=4
 
 # Expose the port the app runs on
 EXPOSE 8000
 
-# Use gunicorn for production with increased timeout and worker configuration
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app", "--timeout", "120", "--workers", "2", "--threads", "2", "--log-level", "info"]
+# Use gunicorn with optimized settings
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT --timeout $GUNICORN_TIMEOUT --workers $GUNICORN_WORKERS --threads $GUNICORN_THREADS --log-level info app:app"]
