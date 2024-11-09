@@ -20,9 +20,10 @@ COPY . .
 
 # Set environment variables
 ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
 # Expose the port the app runs on
 EXPOSE 8000
 
-# Use gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app", "--timeout", "120"]
+# Use gunicorn for production with increased timeout and worker configuration
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app", "--timeout", "120", "--workers", "2", "--threads", "2", "--log-level", "info"]
