@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # Handle proxy headers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 
 # Configure CORS
@@ -87,7 +87,7 @@ def initialize_firebase():
                 
                 # Verify Firebase connection
                 db = firestore.client()
-                db.collection('health_check').limit(1).get()  # Test query
+                db.collection('health_check').limit(1).get()
                 
                 logger.info("Firebase initialized and connected successfully")
                 firebase_initialized = True
@@ -116,39 +116,85 @@ def get_whisper_model():
             logger.error(f"Whisper model loading error: {e}")
             return None
 
+def check_auth():
+    """Check if user is authenticated."""
+    if 'user_token' not in session:
+        return None
+    try:
+        decoded_token = auth.verify_id_token(session['user_token'])
+        return decoded_token['uid']
+    except Exception as e:
+        logger.error(f"Auth verification error: {e}")
+        return None
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not initialize_firebase():
-            return jsonify({'error': 'Service temporarily unavailable'}), 503
+            return jsonify({'error': 'Service unavailable'}), 503
             
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'No valid authorization token'}), 401
-            
-        try:
-            token = auth_header.split('Bearer ')[1]
-            decoded_token = auth.verify_id_token(token)
-            request.user_id = decoded_token['uid']
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
-            return jsonify({'error': 'Invalid authorization token'}), 401
+        user_id = check_auth()
+        if not user_id:
+            if request.is_json:
+                return jsonify({'error': 'Authentication required'}), 401
+            return redirect(url_for('login'))
             
         return f(*args, **kwargs)
     return decorated_function
 
+# Frontend Routes
 @app.route('/')
 def index():
-    """Root endpoint to confirm service is running."""
-    return jsonify({
-        "status": "running",
-        "version": "1.0",
-        "endpoints": ["/health", "/upload"]
-    })
+    """Render main page."""
+    user_id = check_auth()
+    if not user_id:
+        return redirect(url_for('login'))
+    return render_template('index.html')
 
-@app.route('/health')
+@app.route('/login')
+def login():
+    """Render login page."""
+    if check_auth():
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+@app.route('/signup')
+def signup():
+    """Render signup page."""
+    if check_auth():
+        return redirect(url_for('index'))
+    return render_template('signup.html')
+
+# Authentication API Routes
+@app.route('/api/auth/token', methods=['POST'])
+def store_token():
+    """Store Firebase ID token in session."""
+    if not initialize_firebase():
+        return jsonify({'error': 'Service unavailable'}), 503
+        
+    data = request.get_json()
+    if not data or 'token' not in data:
+        return jsonify({'error': 'No token provided'}), 400
+        
+    try:
+        # Verify the token is valid
+        decoded_token = auth.verify_id_token(data['token'])
+        session['user_token'] = data['token']
+        return jsonify({'status': 'success', 'uid': decoded_token['uid']})
+    except Exception as e:
+        logger.error(f"Token verification error: {e}")
+        return jsonify({'error': 'Invalid token'}), 401
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    """Clear session data."""
+    session.clear()
+    return jsonify({'status': 'success'})
+
+# API Routes
+@app.route('/api/health')
 def health_check():
-    """Enhanced health check endpoint."""
+    """Health check endpoint."""
     status = {
         "service": "audio-transcription",
         "timestamp": time.time(),
@@ -159,7 +205,6 @@ def health_check():
         }
     }
     
-    # Check Firebase
     if initialize_firebase():
         try:
             db = firestore.client()
@@ -168,17 +213,15 @@ def health_check():
         except Exception as e:
             status["components"]["firebase"] = f"error: {str(e)}"
     
-    # Check Whisper model
     if get_whisper_model() is not None:
         status["components"]["whisper_model"] = "loaded"
     
-    # Determine overall health
     status["healthy"] = all(v in ["running", "connected", "loaded"] 
                           for v in status["components"].values())
     
     return jsonify(status), 200 if status["healthy"] else 503
 
-@app.route('/upload', methods=['POST'])
+@app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_audio():
     """Handle audio file upload and transcription."""
@@ -218,11 +261,12 @@ def upload_audio():
                 result = model.transcribe(temp_wav.name)
                 transcription = result['text']
 
+                user_id = check_auth()
                 # Store in Firestore
                 db = firestore.client()
                 doc_ref = db.collection('transcriptions').document()
                 doc_ref.set({
-                    'userId': request.user_id,
+                    'userId': user_id,
                     'transcription': transcription,
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'filename': audio_file.filename,
@@ -255,6 +299,30 @@ def upload_audio():
             "error": "Internal server error",
             "status": "error"
         }), 500
+
+@app.route('/api/transcriptions', methods=['GET'])
+@login_required
+def get_transcriptions():
+    """Get user's transcription history."""
+    try:
+        user_id = check_auth()
+        db = firestore.client()
+        docs = db.collection('transcriptions')\
+                 .where('userId', '==', user_id)\
+                 .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                 .limit(50)\
+                 .stream()
+        
+        transcriptions = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            transcriptions.append(data)
+            
+        return jsonify(transcriptions)
+    except Exception as e:
+        logger.error(f"Error fetching transcriptions: {e}")
+        return jsonify({"error": "Failed to fetch transcriptions"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
