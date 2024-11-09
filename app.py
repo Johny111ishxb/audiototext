@@ -1,6 +1,7 @@
 import os
 import secrets
 import time
+from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
 from functools import wraps
@@ -10,18 +11,43 @@ from pydub import AudioSegment
 import whisper
 import tempfile
 import gc
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
-app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
+app.secret_key = os.environ.get('SECRET_KEY')
+if not app.secret_key:
+    logger.warning("SECRET_KEY not set in environment variables. Generating random key...")
+    app.secret_key = secrets.token_hex(24)
+
+# Configure CORS
 CORS(app, supports_credentials=True)
 
-# Initialize Firebase Admin SDK with credentials from environment variables
+# Validate required environment variables
+required_env_vars = [
+    'FIREBASE_PROJECT_ID',
+    'FIREBASE_PRIVATE_KEY_ID',
+    'FIREBASE_PRIVATE_KEY',
+    'FIREBASE_CLIENT_EMAIL',
+    'FIREBASE_CLIENT_ID',
+    'FIREBASE_CLIENT_CERT_URL',
+    'FIREBASE_STORAGE_BUCKET'
+]
+
+missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+# Initialize Firebase Admin SDK
 cred_dict = {
     "type": "service_account",
     "project_id": os.environ.get('FIREBASE_PROJECT_ID'),
     "private_key_id": os.environ.get('FIREBASE_PRIVATE_KEY_ID'),
-    "private_key": os.environ.get('FIREBASE_PRIVATE_KEY').replace('\\n', '\n'),
+    "private_key": os.environ.get('FIREBASE_PRIVATE_KEY'),
     "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL'),
     "client_id": os.environ.get('FIREBASE_CLIENT_ID'),
     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -35,12 +61,14 @@ try:
     firebase_admin.initialize_app(cred, {
         'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
     })
-    print("Firebase initialized successfully")
+    logger.info("Firebase initialized successfully")
+    
+    # Initialize Firestore
+    db = firestore.client()
+    logger.info("Firestore client initialized successfully")
 except Exception as e:
-    print(f"Error initializing Firebase: {e}")
-
-# Initialize Firestore
-db = firestore.client()
+    logger.error(f"Error initializing Firebase: {e}")
+    raise
 
 # Initialize Whisper model (lazy loading)
 model = None
@@ -48,7 +76,12 @@ model = None
 def get_whisper_model():
     global model
     if model is None:
-        model = whisper.load_model("base")
+        try:
+            model = whisper.load_model("base")
+            logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading Whisper model: {e}")
+            raise
     return model
 
 def login_required(f):
@@ -60,7 +93,8 @@ def login_required(f):
             decoded_token = auth.verify_id_token(session['user_token'])
             session['user_id'] = decoded_token['uid']
         except Exception as e:
-            print(f"Auth error: {e}")
+            logger.error(f"Auth error: {e}")
+            session.clear()
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
@@ -78,10 +112,16 @@ def send_static(path):
 def signup():
     if request.method == 'POST':
         try:
-            data = request.json
+            data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'No data provided'}), 400
+            
             email = data.get('email')
             password = data.get('password')
             firstname = data.get('firstname')
+            
+            if not all([email, password, firstname]):
+                return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
 
             # Create user in Firebase
             user = auth.create_user(
@@ -107,6 +147,7 @@ def signup():
             })
 
         except Exception as e:
+            logger.error(f"Signup error: {e}")
             return jsonify({
                 'status': 'error',
                 'message': str(e)
@@ -118,9 +159,15 @@ def signup():
 def login():
     if request.method == 'POST':
         try:
-            data = request.json
+            data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'No data provided'}), 400
+            
             email = data.get('email')
             password = data.get('password')
+            
+            if not all([email, password]):
+                return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
 
             # Get user by email
             user = auth.get_user_by_email(email)
@@ -132,6 +179,7 @@ def login():
             })
 
         except Exception as e:
+            logger.error(f"Login error: {e}")
             return jsonify({
                 'status': 'error',
                 'message': str(e)
@@ -152,7 +200,7 @@ def verify_token():
         session['user_id'] = decoded_token['uid']
         return jsonify({'status': 'success', 'uid': decoded_token['uid']})
     except Exception as e:
-        print(f"Token verification error: {e}")
+        logger.error(f"Token verification error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 401
 
 @app.route('/logout')
@@ -164,6 +212,7 @@ def logout():
 @login_required
 def upload_audio():
     try:
+        # Verify authorization
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"error": "No authorization token provided"}), 401
@@ -173,8 +222,10 @@ def upload_audio():
             decoded_token = auth.verify_id_token(token)
             user_id = decoded_token['uid']
         except Exception as e:
+            logger.error(f"Token verification error in upload: {e}")
             return jsonify({"error": "Invalid authorization token"}), 401
 
+        # Check for file
         if 'audio_file' not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
 
@@ -182,24 +233,31 @@ def upload_audio():
         if audio_file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        # Use tempfile for better memory management
+        # Process audio file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
-            if audio_file.filename.lower().endswith('.mp3'):
-                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_mp3:
-                    audio_file.save(temp_mp3.name)
-                    audio = AudioSegment.from_mp3(temp_mp3.name)
-                    audio.export(temp_wav.name, format='wav')
-                    os.unlink(temp_mp3.name)
-            else:
-                audio_file.save(temp_wav.name)
-
             try:
-                # Get the Whisper model
+                if audio_file.filename.lower().endswith('.mp3'):
+                    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_mp3:
+                        audio_file.save(temp_mp3.name)
+                        audio = AudioSegment.from_mp3(temp_mp3.name)
+                        audio.export(temp_wav.name, format='wav')
+                        os.unlink(temp_mp3.name)
+                else:
+                    audio_file.save(temp_wav.name)
+
+                # Get the Whisper model and transcribe
                 model = get_whisper_model()
-                
-                # Transcribe the audio
                 result = model.transcribe(temp_wav.name)
                 transcription = result['text']
+
+                # Store transcription in Firestore
+                doc_ref = db.collection('transcriptions').document()
+                doc_ref.set({
+                    'userId': user_id,
+                    'transcription': transcription,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'filename': audio_file.filename
+                })
 
                 # Clean up
                 del result
@@ -207,24 +265,43 @@ def upload_audio():
 
                 return jsonify({
                     "transcription": transcription,
-                    "status": "success"
+                    "status": "success",
+                    "docId": doc_ref.id
                 })
 
+            except Exception as e:
+                logger.error(f"Error processing audio: {e}")
+                return jsonify({
+                    "error": f"Error processing audio: {str(e)}",
+                    "status": "error"
+                }), 500
             finally:
                 # Ensure temporary file is removed
-                os.unlink(temp_wav.name)
+                if os.path.exists(temp_wav.name):
+                    os.unlink(temp_wav.name)
 
     except Exception as e:
-        print(f"Error processing audio: {str(e)}")
+        logger.error(f"Upload error: {e}")
         return jsonify({
-            "error": f"Error processing audio: {str(e)}",
+            "error": f"Upload error: {str(e)}",
             "status": "error"
         }), 500
 
-# Health check endpoint for Railway
 @app.route('/health')
 def health_check():
-    return jsonify({"status": "healthy"}), 200
+    try:
+        # Check Firebase connection
+        db.collection('users').limit(1).get()
+        return jsonify({
+            "status": "healthy",
+            "firebase": "connected"
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
