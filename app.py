@@ -14,17 +14,28 @@ import tempfile
 import gc
 import logging
 from threading import Lock
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # Handle proxy headers
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 
 # Configure CORS
-CORS(app, supports_credentials=True)
+CORS(app, supports_credentials=True, resources={
+    r"/*": {
+        "origins": os.environ.get('ALLOWED_ORIGINS', '*').split(','),
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Global variables
 firebase_initialized = False
@@ -32,7 +43,27 @@ firebase_init_lock = Lock()
 whisper_model = None
 whisper_model_lock = Lock()
 
+def load_firebase_credentials():
+    """Load Firebase credentials from environment variable or file."""
+    creds_str = os.environ.get('FIREBASE_CREDENTIALS')
+    if creds_str:
+        try:
+            return json.loads(creds_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing Firebase credentials from environment: {e}")
+    
+    creds_path = os.environ.get('FIREBASE_CREDENTIALS_PATH')
+    if creds_path and os.path.exists(creds_path):
+        try:
+            with open(creds_path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading Firebase credentials from file: {e}")
+    
+    return None
+
 def initialize_firebase():
+    """Initialize Firebase with proper error handling."""
     global firebase_initialized
     
     if firebase_initialized:
@@ -43,15 +74,9 @@ def initialize_firebase():
             return True
             
         try:
-            firebase_creds_str = os.environ.get('FIREBASE_CREDENTIALS')
-            if not firebase_creds_str:
-                logger.error("FIREBASE_CREDENTIALS environment variable is not set")
-                return False
-            
-            try:
-                cred_dict = json.loads(firebase_creds_str)
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing Firebase credentials JSON: {e}")
+            cred_dict = load_firebase_credentials()
+            if not cred_dict:
+                logger.error("Firebase credentials not found")
                 return False
 
             if not firebase_admin._apps:
@@ -59,16 +84,21 @@ def initialize_firebase():
                 firebase_admin.initialize_app(cred, {
                     'storageBucket': f"{cred_dict.get('project_id')}.appspot.com"
                 })
-                logger.info("Firebase initialized successfully")
-            
-            firebase_initialized = True
-            return True
+                
+                # Verify Firebase connection
+                db = firestore.client()
+                db.collection('health_check').limit(1).get()  # Test query
+                
+                logger.info("Firebase initialized and connected successfully")
+                firebase_initialized = True
+                return True
             
         except Exception as e:
-            logger.error(f"Error initializing Firebase: {e}")
+            logger.error(f"Firebase initialization error: {e}")
             return False
 
 def get_whisper_model():
+    """Load Whisper model with proper error handling."""
     global whisper_model
     
     if whisper_model is not None:
@@ -83,54 +113,75 @@ def get_whisper_model():
             logger.info("Whisper model loaded successfully")
             return whisper_model
         except Exception as e:
-            logger.error(f"Error loading Whisper model: {e}")
+            logger.error(f"Whisper model loading error: {e}")
             return None
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not initialize_firebase():
-            return jsonify({'error': 'Firebase initialization failed'}), 500
+            return jsonify({'error': 'Service temporarily unavailable'}), 503
             
-        if 'user_token' not in session:
-            return redirect(url_for('login'))
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'No valid authorization token'}), 401
+            
         try:
-            decoded_token = auth.verify_id_token(session['user_token'])
-            session['user_id'] = decoded_token['uid']
+            token = auth_header.split('Bearer ')[1]
+            decoded_token = auth.verify_id_token(token)
+            request.user_id = decoded_token['uid']
         except Exception as e:
-            logger.error(f"Auth error: {e}")
-            session.clear()
-            return redirect(url_for('login'))
+            logger.error(f"Authentication error: {e}")
+            return jsonify({'error': 'Invalid authorization token'}), 401
+            
         return f(*args, **kwargs)
     return decorated_function
 
+@app.route('/')
+def index():
+    """Root endpoint to confirm service is running."""
+    return jsonify({
+        "status": "running",
+        "version": "1.0",
+        "endpoints": ["/health", "/upload"]
+    })
+
 @app.route('/health')
 def health_check():
+    """Enhanced health check endpoint."""
     status = {
-        "app": "running",
-        "firebase_initialized": firebase_initialized,
-        "whisper_model_loaded": whisper_model is not None
+        "service": "audio-transcription",
+        "timestamp": time.time(),
+        "components": {
+            "app": "running",
+            "firebase": "not_initialized",
+            "whisper_model": "not_loaded"
+        }
     }
     
-    try:
-        if initialize_firebase():
-            # Quick Firebase test
+    # Check Firebase
+    if initialize_firebase():
+        try:
             db = firestore.client()
             db.collection('health_check').limit(1).get()
-            status["firebase_connection"] = "working"
-        else:
-            status["firebase_connection"] = "failed"
-    except Exception as e:
-        status["firebase_connection"] = f"error: {str(e)}"
+            status["components"]["firebase"] = "connected"
+        except Exception as e:
+            status["components"]["firebase"] = f"error: {str(e)}"
     
-    if all(v in [True, "working"] for v in status.values()):
-        return jsonify(status), 200
-    else:
-        return jsonify(status), 503
+    # Check Whisper model
+    if get_whisper_model() is not None:
+        status["components"]["whisper_model"] = "loaded"
+    
+    # Determine overall health
+    status["healthy"] = all(v in ["running", "connected", "loaded"] 
+                          for v in status["components"].values())
+    
+    return jsonify(status), 200 if status["healthy"] else 503
 
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_audio():
+    """Handle audio file upload and transcription."""
     if not initialize_firebase():
         return jsonify({"error": "Service unavailable"}), 503
 
@@ -141,6 +192,12 @@ def upload_audio():
         audio_file = request.files['audio_file']
         if audio_file.filename == '':
             return jsonify({"error": "No file selected"}), 400
+
+        # Validate file type
+        allowed_extensions = {'mp3', 'wav', 'ogg', 'flac'}
+        if not ('.' in audio_file.filename and 
+                audio_file.filename.rsplit('.', 1)[1].lower() in allowed_extensions):
+            return jsonify({"error": "Invalid file type"}), 400
 
         # Process audio file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
@@ -156,19 +213,20 @@ def upload_audio():
 
                 model = get_whisper_model()
                 if model is None:
-                    return jsonify({"error": "Failed to load transcription model"}), 503
+                    return jsonify({"error": "Transcription service unavailable"}), 503
 
                 result = model.transcribe(temp_wav.name)
                 transcription = result['text']
 
-                # Store transcription in Firestore
+                # Store in Firestore
                 db = firestore.client()
                 doc_ref = db.collection('transcriptions').document()
                 doc_ref.set({
-                    'userId': session['user_id'],
+                    'userId': request.user_id,
                     'transcription': transcription,
                     'timestamp': firestore.SERVER_TIMESTAMP,
-                    'filename': audio_file.filename
+                    'filename': audio_file.filename,
+                    'status': 'completed'
                 })
 
                 # Clean up
@@ -182,9 +240,9 @@ def upload_audio():
                 })
 
             except Exception as e:
-                logger.error(f"Error processing audio: {e}")
+                logger.error(f"Audio processing error: {e}")
                 return jsonify({
-                    "error": f"Error processing audio: {str(e)}",
+                    "error": "Error processing audio file",
                     "status": "error"
                 }), 500
             finally:
@@ -194,11 +252,16 @@ def upload_audio():
     except Exception as e:
         logger.error(f"Upload error: {e}")
         return jsonify({
-            "error": f"Upload error: {str(e)}",
+            "error": "Internal server error",
             "status": "error"
         }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
-    initialize_firebase()  # Initialize Firebase on startup
-    app.run(host='0.0.0.0', port=port)
+    debug = os.environ.get("FLASK_ENV") == "development"
+    
+    # Initialize services on startup
+    initialize_firebase()
+    get_whisper_model()
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
