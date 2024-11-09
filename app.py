@@ -1,6 +1,7 @@
 import os
 import secrets
 import time
+import json
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
@@ -27,39 +28,24 @@ if not app.secret_key:
 # Configure CORS
 CORS(app, supports_credentials=True)
 
-# Validate required environment variables
-required_env_vars = [
-    'FIREBASE_PROJECT_ID',
-    'FIREBASE_PRIVATE_KEY_ID',
-    'FIREBASE_PRIVATE_KEY',
-    'FIREBASE_CLIENT_EMAIL',
-    'FIREBASE_CLIENT_ID',
-    'FIREBASE_CLIENT_CERT_URL',
-    'FIREBASE_STORAGE_BUCKET'
-]
-
-missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
-if missing_vars:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-
 # Initialize Firebase Admin SDK
-cred_dict = {
-    "type": "service_account",
-    "project_id": os.environ.get('FIREBASE_PROJECT_ID'),
-    "private_key_id": os.environ.get('FIREBASE_PRIVATE_KEY_ID'),
-    "private_key": os.environ.get('FIREBASE_PRIVATE_KEY'),
-    "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL'),
-    "client_id": os.environ.get('FIREBASE_CLIENT_ID'),
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": os.environ.get('FIREBASE_CLIENT_CERT_URL')
-}
-
 try:
+    # Get Firebase credentials from environment variable
+    firebase_creds_str = os.environ.get('FIREBASE_CREDENTIALS')
+    if not firebase_creds_str:
+        raise ValueError("FIREBASE_CREDENTIALS environment variable is not set")
+    
+    # Parse the JSON string into a dictionary
+    try:
+        cred_dict = json.loads(firebase_creds_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing Firebase credentials JSON: {e}")
+        raise ValueError("Invalid JSON in FIREBASE_CREDENTIALS")
+
+    # Initialize Firebase with credentials
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred, {
-        'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
+        'storageBucket': cred_dict.get('project_id') + '.appspot.com'
     })
     logger.info("Firebase initialized successfully")
     
@@ -212,20 +198,6 @@ def logout():
 @login_required
 def upload_audio():
     try:
-        # Verify authorization
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "No authorization token provided"}), 401
-        
-        token = auth_header.split(' ')[1]
-        try:
-            decoded_token = auth.verify_id_token(token)
-            user_id = decoded_token['uid']
-        except Exception as e:
-            logger.error(f"Token verification error in upload: {e}")
-            return jsonify({"error": "Invalid authorization token"}), 401
-
-        # Check for file
         if 'audio_file' not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
 
@@ -253,7 +225,7 @@ def upload_audio():
                 # Store transcription in Firestore
                 doc_ref = db.collection('transcriptions').document()
                 doc_ref.set({
-                    'userId': user_id,
+                    'userId': session['user_id'],
                     'transcription': transcription,
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'filename': audio_file.filename
@@ -287,20 +259,62 @@ def upload_audio():
             "status": "error"
         }), 500
 
+@app.route('/get-transcriptions')
+@login_required
+def get_transcriptions():
+    try:
+        transcriptions = db.collection('transcriptions')\
+            .where('userId', '==', session['user_id'])\
+            .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+            .limit(10)\
+            .stream()
+        
+        return jsonify({
+            'status': 'success',
+            'transcriptions': [{
+                'id': doc.id,
+                'filename': doc.get('filename'),
+                'transcription': doc.get('transcription'),
+                'timestamp': doc.get('timestamp')
+            } for doc in transcriptions]
+        })
+    except Exception as e:
+        logger.error(f"Error fetching transcriptions: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
 @app.route('/health')
 def health_check():
     try:
         # Check Firebase connection
         db.collection('users').limit(1).get()
+        
+        # Check if we can access the Firebase project
+        try:
+            auth.get_user_by_email("test@test.com")
+        except auth.UserNotFoundError:
+            # This is actually a successful test - we confirmed we can talk to Firebase
+            pass
+        except Exception as e:
+            logger.error(f"Firebase auth test failed: {e}")
+            raise
+        
         return jsonify({
             "status": "healthy",
-            "firebase": "connected"
+            "firebase": "connected",
+            "project_id": cred_dict.get('project_id')
         }), 200
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return jsonify({
             "status": "unhealthy",
-            "error": str(e)
+            "error": str(e),
+            "details": {
+                "firebase_credentials_present": bool(firebase_creds_str),
+                "firebase_initialized": "firebase_admin" in globals()
+            }
         }), 500
 
 if __name__ == '__main__':
