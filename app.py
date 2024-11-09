@@ -9,23 +9,47 @@ from firebase_admin import credentials, auth, storage, firestore
 from pydub import AudioSegment
 import whisper
 import tempfile
+import gc
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 CORS(app, supports_credentials=True)
 
-# Initialize Firebase Admin SDK
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {
-    'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
-})
+# Initialize Firebase Admin SDK with credentials from environment variables
+cred_dict = {
+    "type": "service_account",
+    "project_id": os.environ.get('FIREBASE_PROJECT_ID'),
+    "private_key_id": os.environ.get('FIREBASE_PRIVATE_KEY_ID'),
+    "private_key": os.environ.get('FIREBASE_PRIVATE_KEY').replace('\\n', '\n'),
+    "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL'),
+    "client_id": os.environ.get('FIREBASE_CLIENT_ID'),
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": os.environ.get('FIREBASE_CLIENT_CERT_URL')
+}
+
+try:
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred, {
+        'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
+    })
+    print("Firebase initialized successfully")
+except Exception as e:
+    print(f"Error initializing Firebase: {e}")
 
 # Initialize Firestore
 db = firestore.client()
 
-# Initialize Whisper model
-model = whisper.load_model("base")
+# Initialize Whisper model (lazy loading)
+model = None
+
+def get_whisper_model():
+    global model
+    if model is None:
+        model = whisper.load_model("base")
+    return model
 
 def login_required(f):
     @wraps(f)
@@ -98,8 +122,7 @@ def login():
             email = data.get('email')
             password = data.get('password')
 
-            # Verify user credentials (you'll need to implement this)
-            # For now, we'll just create a custom token
+            # Get user by email
             user = auth.get_user_by_email(email)
             custom_token = auth.create_custom_token(user.uid)
             
@@ -159,40 +182,37 @@ def upload_audio():
         if audio_file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        temp_dir = f"temp_audio/{user_id}"
-        os.makedirs(temp_dir, exist_ok=True)
-        unique_filename = f"audio_{int(time.time())}"
-        temp_path = os.path.join(temp_dir, unique_filename)
-        
-        audio_file.save(temp_path)
-        
-        try:
+        # Use tempfile for better memory management
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
             if audio_file.filename.lower().endswith('.mp3'):
-                audio = AudioSegment.from_mp3(temp_path)
-                wav_path = f"{temp_path}.wav"
-                audio.export(wav_path, format='wav')
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_mp3:
+                    audio_file.save(temp_mp3.name)
+                    audio = AudioSegment.from_mp3(temp_mp3.name)
+                    audio.export(temp_wav.name, format='wav')
+                    os.unlink(temp_mp3.name)
             else:
-                wav_path = temp_path
+                audio_file.save(temp_wav.name)
 
-            result = model.transcribe(wav_path)
-            transcription = result['text']
+            try:
+                # Get the Whisper model
+                model = get_whisper_model()
+                
+                # Transcribe the audio
+                result = model.transcribe(temp_wav.name)
+                transcription = result['text']
 
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            if os.path.exists(wav_path) and wav_path != temp_path:
-                os.remove(wav_path)
+                # Clean up
+                del result
+                gc.collect()
 
-            return jsonify({
-                "transcription": transcription,
-                "status": "success"
-            })
+                return jsonify({
+                    "transcription": transcription,
+                    "status": "success"
+                })
 
-        except Exception as e:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            if 'wav_path' in locals() and os.path.exists(wav_path):
-                os.remove(wav_path)
-            raise e
+            finally:
+                # Ensure temporary file is removed
+                os.unlink(temp_wav.name)
 
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
@@ -201,5 +221,11 @@ def upload_audio():
             "status": "error"
         }), 500
 
+# Health check endpoint for Railway
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host='0.0.0.0', port=port)
