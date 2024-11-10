@@ -2,19 +2,19 @@ import os
 import secrets
 import time
 import json
+import logging
+import tempfile
+import gc
 from pathlib import Path
+from threading import Lock
+from functools import wraps
 from flask import Flask, render_template, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
-from functools import wraps
+from werkzeug.middleware.proxy_fix import ProxyFix
 import firebase_admin
 from firebase_admin import credentials, auth, storage, firestore
 from pydub import AudioSegment
 import whisper
-import tempfile
-import gc
-import logging
-from threading import Lock
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Configure logging
 logging.basicConfig(
@@ -26,12 +26,18 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+# Load secret key from environment or generate one
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 
 # Configure CORS with specific origins
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '').split(',')
+if not ALLOWED_ORIGINS or ALLOWED_ORIGINS[0] == '':
+    ALLOWED_ORIGINS = ['https://audiototext-production.up.railway.app']
+
 CORS(app, supports_credentials=True, resources={
     r"/*": {
-        "origins": os.environ.get('ALLOWED_ORIGINS', 'https://your-railway-domain.up.railway.app').split(','),
+        "origins": ALLOWED_ORIGINS,
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": True
@@ -43,26 +49,6 @@ firebase_initialized = False
 firebase_init_lock = Lock()
 whisper_model = None
 whisper_model_lock = Lock()
-
-def load_firebase_credentials():
-    """Load Firebase credentials from environment variable or file."""
-    try:
-        # First try environment variable
-        creds_json = os.environ.get('FIREBASE_CREDENTIALS')
-        if creds_json:
-            return json.loads(creds_json)
-            
-        # Fallback to file
-        creds_path = os.environ.get('FIREBASE_CREDENTIALS_PATH')
-        if creds_path and os.path.exists(creds_path):
-            with open(creds_path) as f:
-                return json.load(f)
-                
-        logger.error("No Firebase credentials found")
-        return None
-    except Exception as e:
-        logger.error(f"Error loading Firebase credentials: {e}")
-        return None
 
 def initialize_firebase():
     """Initialize Firebase with proper error handling."""
@@ -76,27 +62,32 @@ def initialize_firebase():
             return True
             
         try:
-            cred_dict = load_firebase_credentials()
-            if not cred_dict:
-                logger.error("Firebase credentials not found")
-                return False
-
             if not firebase_admin._apps:
-                cred = credentials.Certificate(cred_dict)
-                firebase_admin.initialize_app(cred, {
-                    'storageBucket': f"{cred_dict.get('project_id')}.appspot.com"
-                })
+                # Load credentials from environment variable
+                creds_json = os.environ.get('FIREBASE_CREDENTIALS')
+                if not creds_json:
+                    logger.error("FIREBASE_CREDENTIALS environment variable not found")
+                    return False
                 
-                # Verify Firebase connection
-                db = firestore.client()
-                db.collection('health_check').limit(1).get()
-                
-                logger.info("Firebase initialized successfully")
-                firebase_initialized = True
-                return True
-                
+                try:
+                    cred_dict = json.loads(creds_json)
+                    cred = credentials.Certificate(cred_dict)
+                    firebase_admin.initialize_app(cred, {
+                        'storageBucket': f"{cred_dict['project_id']}.appspot.com"
+                    })
+                    
+                    # Verify Firebase connection
+                    db = firestore.client()
+                    db.collection('users').limit(1).get()  # Test query
+                    
+                    logger.info("Firebase initialized successfully")
+                    firebase_initialized = True
+                    return True
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON in FIREBASE_CREDENTIALS")
+                    return False
         except Exception as e:
-            logger.error(f"Firebase initialization error: {e}")
+            logger.error(f"Firebase initialization error: {str(e)}")
             return False
 
 def get_whisper_model():
@@ -115,19 +106,19 @@ def get_whisper_model():
             logger.info("Whisper model loaded successfully")
             return whisper_model
         except Exception as e:
-            logger.error(f"Whisper model loading error: {e}")
+            logger.error(f"Whisper model loading error: {str(e)}")
             return None
 
 def check_auth():
     """Check if user is authenticated and return user ID."""
     if 'user_token' not in session:
         return None
-        
+    
     try:
         decoded_token = auth.verify_id_token(session['user_token'])
         return decoded_token['uid']
     except Exception as e:
-        logger.error(f"Auth verification error: {e}")
+        logger.error(f"Auth verification error: {str(e)}")
         session.clear()
         return None
 
@@ -136,6 +127,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not initialize_firebase():
+            logger.error("Firebase not initialized")
             return jsonify({'error': 'Service unavailable'}), 503
             
         user_id = check_auth()
@@ -149,26 +141,25 @@ def login_required(f):
 
 # Frontend Routes
 @app.route('/')
+@login_required
 def index():
-    """Render main page."""
-    user_id = check_auth()
-    if not user_id:
-        return redirect(url_for('login'))
     return render_template('index.html')
 
 @app.route('/login')
 def login():
-    """Render login page."""
     if check_auth():
         return redirect(url_for('index'))
     return render_template('login.html')
 
 @app.route('/signup')
 def signup():
-    """Render signup page."""
     if check_auth():
         return redirect(url_for('index'))
     return render_template('signup.html')
+
+@app.route('/static/<path:path>')
+def send_static(path):
+    return send_from_directory('static', path)
 
 # Authentication API Routes
 @app.route('/api/auth/token', methods=['POST'])
@@ -180,6 +171,7 @@ def store_token():
     try:
         data = request.get_json()
         if not data or 'token' not in data:
+            logger.error("No token provided in request")
             return jsonify({'error': 'No token provided'}), 400
         
         # Verify the token is valid
@@ -188,15 +180,12 @@ def store_token():
         session['user_id'] = decoded_token['uid']
         
         logger.info(f"User {decoded_token['uid']} authenticated successfully")
-        return jsonify({
-            'status': 'success',
-            'uid': decoded_token['uid']
-        })
-    except auth.InvalidIdTokenError:
-        logger.error("Invalid Firebase token")
+        return jsonify({'status': 'success', 'uid': decoded_token['uid']})
+    except auth.InvalidIdTokenError as e:
+        logger.error(f"Invalid Firebase token: {str(e)}")
         return jsonify({'error': 'Invalid token'}), 401
     except Exception as e:
-        logger.error(f"Token verification error: {e}")
+        logger.error(f"Token verification error: {str(e)}")
         return jsonify({'error': 'Authentication failed'}), 500
 
 @app.route('/api/auth/logout', methods=['POST'])
@@ -205,36 +194,7 @@ def logout():
     session.clear()
     return jsonify({'status': 'success'})
 
-# API Routes
-@app.route('/api/health')
-def health_check():
-    """Health check endpoint."""
-    status = {
-        "service": "audio-transcription",
-        "timestamp": time.time(),
-        "components": {
-            "app": "running",
-            "firebase": "not_initialized",
-            "whisper_model": "not_loaded"
-        }
-    }
-    
-    if initialize_firebase():
-        try:
-            db = firestore.client()
-            db.collection('health_check').limit(1).get()
-            status["components"]["firebase"] = "connected"
-        except Exception as e:
-            status["components"]["firebase"] = f"error: {str(e)}"
-    
-    if get_whisper_model() is not None:
-        status["components"]["whisper_model"] = "loaded"
-    
-    status["healthy"] = all(v in ["running", "connected", "loaded"] 
-                           for v in status["components"].values())
-    
-    return jsonify(status), 200 if status["healthy"] else 503
-
+# Audio Processing Routes
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_audio():
@@ -298,7 +258,7 @@ def upload_audio():
                 })
 
             except Exception as e:
-                logger.error(f"Audio processing error: {e}")
+                logger.error(f"Audio processing error: {str(e)}")
                 return jsonify({
                     "error": "Error processing audio file",
                     "details": str(e)
@@ -308,7 +268,7 @@ def upload_audio():
                     os.unlink(temp_wav.name)
 
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"Upload error: {str(e)}")
         return jsonify({
             "error": "Internal server error",
             "details": str(e)
@@ -338,11 +298,41 @@ def get_transcriptions():
             
         return jsonify(transcriptions)
     except Exception as e:
-        logger.error(f"Error fetching transcriptions: {e}")
+        logger.error(f"Error fetching transcriptions: {str(e)}")
         return jsonify({
             "error": "Failed to fetch transcriptions",
             "details": str(e)
         }), 500
+
+# Health Check Route
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint."""
+    status = {
+        "service": "audio-transcription",
+        "timestamp": time.time(),
+        "components": {
+            "app": "running",
+            "firebase": "not_initialized",
+            "whisper_model": "not_loaded"
+        }
+    }
+    
+    if initialize_firebase():
+        try:
+            db = firestore.client()
+            db.collection('health_check').limit(1).get()
+            status["components"]["firebase"] = "connected"
+        except Exception as e:
+            status["components"]["firebase"] = f"error: {str(e)}"
+    
+    if get_whisper_model() is not None:
+        status["components"]["whisper_model"] = "loaded"
+    
+    status["healthy"] = all(v in ["running", "connected", "loaded"] 
+                           for v in status["components"].values())
+    
+    return jsonify(status), 200 if status["healthy"] else 503
 
 # Error handlers
 @app.errorhandler(404)
@@ -353,6 +343,7 @@ def not_found_error(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    logger.error(f"Internal server error: {str(error)}")
     if request.is_json:
         return jsonify({"error": "Internal server error"}), 500
     return render_template('500.html'), 500
@@ -362,7 +353,11 @@ if __name__ == '__main__':
     debug = os.environ.get('FLASK_ENV') == 'development'
     
     # Initialize services on startup
-    initialize_firebase()
-    get_whisper_model()
+    if not initialize_firebase():
+        logger.error("Failed to initialize Firebase. Check your credentials.")
+    
+    # Load Whisper model
+    if get_whisper_model() is None:
+        logger.error("Failed to load Whisper model")
     
     app.run(host='0.0.0.0', port=port, debug=debug)
