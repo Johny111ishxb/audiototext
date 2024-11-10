@@ -5,6 +5,7 @@ import json
 import logging
 import tempfile
 import gc
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from functools import wraps
@@ -27,8 +28,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
-# Load secret key from environment or generate one
+# Load secret key from environment
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
+app.permanent_session_lifetime = timedelta(hours=1)  # Set session lifetime
 
 # Configure CORS with specific origins
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '').split(',')
@@ -63,7 +65,6 @@ def initialize_firebase():
             
         try:
             if not firebase_admin._apps:
-                # Load credentials from environment variable
                 creds_json = os.environ.get('FIREBASE_CREDENTIALS')
                 if not creds_json:
                     logger.error("FIREBASE_CREDENTIALS environment variable not found")
@@ -78,11 +79,12 @@ def initialize_firebase():
                     
                     # Verify Firebase connection
                     db = firestore.client()
-                    db.collection('users').limit(1).get()  # Test query
+                    db.collection('users').limit(1).get()
                     
                     logger.info("Firebase initialized successfully")
                     firebase_initialized = True
                     return True
+                    
                 except json.JSONDecodeError:
                     logger.error("Invalid JSON in FIREBASE_CREDENTIALS")
                     return False
@@ -110,11 +112,19 @@ def get_whisper_model():
             return None
 
 def check_auth():
-    """Check if user is authenticated and return user ID."""
+    """Check if user is authenticated and verify token expiration."""
     if 'user_token' not in session:
         return None
     
     try:
+        # Check token expiration
+        if 'token_exp' in session:
+            exp_time = datetime.fromtimestamp(session['token_exp'])
+            if exp_time < datetime.utcnow():
+                logger.info("Token expired, clearing session")
+                session.clear()
+                return None
+
         decoded_token = auth.verify_id_token(session['user_token'])
         return decoded_token['uid']
     except Exception as e:
@@ -164,8 +174,9 @@ def send_static(path):
 # Authentication API Routes
 @app.route('/api/auth/token', methods=['POST'])
 def store_token():
-    """Store Firebase ID token in session."""
+    """Store Firebase ID token in session with enhanced error handling."""
     if not initialize_firebase():
+        logger.error("Firebase not initialized")
         return jsonify({'error': 'Service unavailable'}), 503
         
     try:
@@ -176,11 +187,26 @@ def store_token():
         
         # Verify the token is valid
         decoded_token = auth.verify_id_token(data['token'])
+        
+        # Check token expiration
+        exp = datetime.fromtimestamp(decoded_token['exp'])
+        if exp < datetime.utcnow():
+            logger.error("Token expired")
+            return jsonify({'error': 'Token expired'}), 401
+        
+        # Store token and user data in session
+        session.permanent = True
         session['user_token'] = data['token']
         session['user_id'] = decoded_token['uid']
+        session['token_exp'] = exp.timestamp()
         
         logger.info(f"User {decoded_token['uid']} authenticated successfully")
-        return jsonify({'status': 'success', 'uid': decoded_token['uid']})
+        return jsonify({
+            'status': 'success',
+            'uid': decoded_token['uid'],
+            'exp': exp.timestamp()
+        })
+        
     except auth.InvalidIdTokenError as e:
         logger.error(f"Invalid Firebase token: {str(e)}")
         return jsonify({'error': 'Invalid token'}), 401
@@ -188,11 +214,35 @@ def store_token():
         logger.error(f"Token verification error: {str(e)}")
         return jsonify({'error': 'Authentication failed'}), 500
 
+@app.route('/api/auth/refresh', methods=['POST'])
+def refresh_token():
+    """Refresh the session token."""
+    try:
+        data = request.get_json()
+        if not data or 'token' not in data:
+            return jsonify({'error': 'No token provided'}), 400
+            
+        # Verify new token
+        decoded_token = auth.verify_id_token(data['token'])
+        
+        # Update session
+        session['user_token'] = data['token']
+        session['token_exp'] = datetime.fromtimestamp(decoded_token['exp']).timestamp()
+        
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        logger.error(f"Token refresh error: {str(e)}")
+        return jsonify({'error': 'Token refresh failed'}), 500
+
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
-    """Clear session data."""
-    session.clear()
-    return jsonify({'status': 'success'})
+    """Clear session data with proper error handling."""
+    try:
+        session.clear()
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({'error': 'Logout failed'}), 500
 
 # Audio Processing Routes
 @app.route('/api/upload', methods=['POST'])
@@ -291,7 +341,6 @@ def get_transcriptions():
         for doc in docs:
             data = doc.to_dict()
             data['id'] = doc.id
-            # Convert timestamp to string to make it JSON serializable
             if 'timestamp' in data and data['timestamp']:
                 data['timestamp'] = data['timestamp'].isoformat()
             transcriptions.append(data)
