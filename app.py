@@ -1,5 +1,3 @@
-
-getting authentication failed try again error signIn while deploying in railway.
 import os
 import secrets
 import time
