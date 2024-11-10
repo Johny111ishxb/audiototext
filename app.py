@@ -28,12 +28,21 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(24))
 
-# Configure CORS with specific origins
+# Configure session for production
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=86400  # 24 hours
+)
+
+# Configure CORS
 CORS(app, supports_credentials=True, resources={
     r"/*": {
         "origins": os.environ.get('ALLOWED_ORIGINS', 'https://your-railway-domain.up.railway.app').split(','),
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Type", "Authorization"],
         "supports_credentials": True
     }
 })
@@ -47,12 +56,10 @@ whisper_model_lock = Lock()
 def load_firebase_credentials():
     """Load Firebase credentials from environment variable or file."""
     try:
-        # First try environment variable
         creds_json = os.environ.get('FIREBASE_CREDENTIALS')
         if creds_json:
             return json.loads(creds_json)
             
-        # Fallback to file
         creds_path = os.environ.get('FIREBASE_CREDENTIALS_PATH')
         if creds_path and os.path.exists(creds_path):
             with open(creds_path) as f:
@@ -171,9 +178,91 @@ def signup():
     return render_template('signup.html')
 
 # Authentication API Routes
+@app.route('/api/auth/signup', methods=['POST'])
+def signup_api():
+    """Handle signup API request"""
+    if not initialize_firebase():
+        return jsonify({'error': 'Service unavailable'}), 503
+        
+    try:
+        data = request.get_json()
+        if not data or 'email' not in data or 'password' not in data:
+            return jsonify({'error': 'Email and password required'}), 400
+
+        try:
+            # Create user in Firebase
+            user = auth.create_user(
+                email=data['email'],
+                password=data['password'],
+                display_name=data.get('displayName', '')
+            )
+
+            # Create user document in Firestore
+            db = firestore.client()
+            db.collection('users').document(user.uid).set({
+                'email': data['email'],
+                'displayName': data.get('displayName', ''),
+                'createdAt': firestore.SERVER_TIMESTAMP
+            })
+
+            # Create custom token for initial sign-in
+            custom_token = auth.create_custom_token(user.uid)
+
+            return jsonify({
+                'status': 'success',
+                'uid': user.uid,
+                'email': user.email,
+                'displayName': user.display_name,
+                'token': custom_token.decode()
+            })
+
+        except auth.EmailAlreadyExistsError:
+            return jsonify({'error': 'Email already exists'}), 409
+        except Exception as e:
+            logger.error(f"User creation error: {e}")
+            return jsonify({'error': 'Failed to create user'}), 500
+
+    except Exception as e:
+        logger.error(f"Signup error: {e}")
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login_api():
+    """Handle login API request"""
+    if not initialize_firebase():
+        return jsonify({'error': 'Service unavailable'}), 503
+        
+    try:
+        data = request.get_json()
+        if not data or 'email' not in data:
+            return jsonify({'error': 'Email required'}), 400
+
+        try:
+            # Get user by email
+            user = auth.get_user_by_email(data['email'])
+            
+            # Create custom token for client-side auth
+            custom_token = auth.create_custom_token(user.uid)
+            
+            return jsonify({
+                'status': 'success',
+                'token': custom_token.decode(),
+                'uid': user.uid
+            })
+
+        except auth.UserNotFoundError:
+            return jsonify({'error': 'User not found'}), 404
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return jsonify({'error': 'Authentication failed'}), 500
+
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return jsonify({'error': 'Authentication failed'}), 500
+
 @app.route('/api/auth/token', methods=['POST'])
-def store_token():
-    """Store Firebase ID token in session."""
+def verify_token():
+    """Verify and store Firebase ID token."""
     if not initialize_firebase():
         return jsonify({'error': 'Service unavailable'}), 503
         
@@ -182,18 +271,16 @@ def store_token():
         if not data or 'token' not in data:
             return jsonify({'error': 'No token provided'}), 400
         
-        # Verify the token is valid
+        # Verify the token
         decoded_token = auth.verify_id_token(data['token'])
         session['user_token'] = data['token']
         session['user_id'] = decoded_token['uid']
         
-        logger.info(f"User {decoded_token['uid']} authenticated successfully")
         return jsonify({
             'status': 'success',
             'uid': decoded_token['uid']
         })
     except auth.InvalidIdTokenError:
-        logger.error("Invalid Firebase token")
         return jsonify({'error': 'Invalid token'}), 401
     except Exception as e:
         logger.error(f"Token verification error: {e}")
@@ -205,36 +292,7 @@ def logout():
     session.clear()
     return jsonify({'status': 'success'})
 
-# API Routes
-@app.route('/api/health')
-def health_check():
-    """Health check endpoint."""
-    status = {
-        "service": "audio-transcription",
-        "timestamp": time.time(),
-        "components": {
-            "app": "running",
-            "firebase": "not_initialized",
-            "whisper_model": "not_loaded"
-        }
-    }
-    
-    if initialize_firebase():
-        try:
-            db = firestore.client()
-            db.collection('health_check').limit(1).get()
-            status["components"]["firebase"] = "connected"
-        except Exception as e:
-            status["components"]["firebase"] = f"error: {str(e)}"
-    
-    if get_whisper_model() is not None:
-        status["components"]["whisper_model"] = "loaded"
-    
-    status["healthy"] = all(v in ["running", "connected", "loaded"] 
-                           for v in status["components"].values())
-    
-    return jsonify(status), 200 if status["healthy"] else 503
-
+# Audio Processing Routes
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_audio():
@@ -331,7 +389,6 @@ def get_transcriptions():
         for doc in docs:
             data = doc.to_dict()
             data['id'] = doc.id
-            # Convert timestamp to string to make it JSON serializable
             if 'timestamp' in data and data['timestamp']:
                 data['timestamp'] = data['timestamp'].isoformat()
             transcriptions.append(data)
