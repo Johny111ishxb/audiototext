@@ -1,7 +1,20 @@
-// Import the necessary Firebase modules
+// firebaseauth.js
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js';
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js';
-import { getFirestore, doc, setDoc, getDoc } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js';
+import { 
+    getAuth, 
+    createUserWithEmailAndPassword, 
+    signInWithEmailAndPassword, 
+    signInWithPopup, 
+    GoogleAuthProvider, 
+    onAuthStateChanged,
+    signOut
+} from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js';
+import { 
+    getFirestore, 
+    doc, 
+    setDoc, 
+    getDoc 
+} from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js';
 
 // Firebase configuration
 const firebaseConfig = {
@@ -18,35 +31,73 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const googleProvider = new GoogleAuthProvider();
 
-// Function to display error messages
-function displayErrorMessage(message) {
+// UI Helper Functions
+function displayErrorMessage(message, duration = 5000) {
     const errorMessage = document.getElementById("error-message");
     if (errorMessage) {
         errorMessage.textContent = message;
         errorMessage.style.display = 'block';
         setTimeout(() => {
             errorMessage.style.display = 'none';
-        }, 5000);
+        }, duration);
+    } else {
+        console.error('Error:', message);
     }
 }
 
-// Function to display success messages
-function displaySuccessMessage(message) {
+function displaySuccessMessage(message, duration = 3000) {
     const successMessage = document.getElementById("success-message");
     if (successMessage) {
         successMessage.textContent = message;
         successMessage.style.display = 'block';
         setTimeout(() => {
             successMessage.style.display = 'none';
-        }, 5000);
+        }, duration);
     }
 }
 
-// Function to verify token with backend
+function showLoading() {
+    const loadingElement = document.getElementById('loading-spinner');
+    if (loadingElement) {
+        loadingElement.style.display = 'block';
+    }
+}
+
+function hideLoading() {
+    const loadingElement = document.getElementById('loading-spinner');
+    if (loadingElement) {
+        loadingElement.style.display = 'none';
+    }
+}
+
+// Authentication Helper Functions
+function getAuthErrorMessage(errorCode) {
+    const errorMessages = {
+        'auth/email-already-in-use': 'An account with this email already exists.',
+        'auth/invalid-email': 'Invalid email address format.',
+        'auth/operation-not-allowed': 'Email/password accounts are not enabled. Please contact support.',
+        'auth/weak-password': 'Password is too weak. Please use at least 6 characters.',
+        'auth/user-disabled': 'This account has been disabled.',
+        'auth/user-not-found': 'No account found with this email.',
+        'auth/wrong-password': 'Incorrect password.',
+        'auth/network-request-failed': 'Network error. Please check your connection.',
+        'auth/too-many-requests': 'Too many attempts. Please try again later.',
+        'auth/popup-closed-by-user': 'Google sign-in was cancelled.',
+        'auth/cancelled-popup-request': 'Only one popup request allowed at a time.',
+        'auth/popup-blocked': 'The sign-in popup was blocked by your browser.',
+        'auth/requires-recent-login': 'Please sign in again to continue.',
+        'default': 'Authentication failed. Please try again.'
+    };
+    return errorMessages[errorCode] || errorMessages.default;
+}
+
+// API Functions
 async function verifyTokenWithBackend(token) {
     try {
-        const response = await fetch('/verify-token', {
+        showLoading();
+        const response = await fetch('/api/auth/token', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -56,95 +107,147 @@ async function verifyTokenWithBackend(token) {
         });
         
         if (!response.ok) {
-            throw new Error('Token verification failed');
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Token verification failed');
         }
         
         return await response.json();
     } catch (error) {
         console.error('Token verification error:', error);
         throw error;
+    } finally {
+        hideLoading();
     }
 }
 
-// Handle successful authentication
+// Authentication Functions
 async function handleAuthSuccess(user, isNewUser = false) {
     try {
-        const token = await user.getIdToken();
+        showLoading();
+        // Force refresh the token to ensure we have the most recent one
+        const token = await user.getIdToken(true);
         await verifyTokenWithBackend(token);
         
         if (isNewUser) {
-            // For new users, ensure we have their data in Firestore
-            const userDoc = await getDoc(doc(db, "users", user.uid));
-            if (!userDoc.exists()) {
-                await setDoc(doc(db, "users", user.uid), {
-                    firstname: user.displayName || user.email.split('@')[0],
-                    email: user.email,
-                    createdAt: new Date().toISOString()
-                });
-            }
+            // Create or update user document in Firestore
+            await setDoc(doc(db, "users", user.uid), {
+                firstname: user.displayName || user.email.split('@')[0],
+                email: user.email,
+                createdAt: new Date().toISOString(),
+                lastLogin: new Date().toISOString(),
+                photoURL: user.photoURL || null
+            }, { merge: true });
+        } else {
+            // Update last login time
+            await setDoc(doc(db, "users", user.uid), {
+                lastLogin: new Date().toISOString()
+            }, { merge: true });
         }
         
         displaySuccessMessage("Authentication successful! Redirecting...");
-        setTimeout(() => {
-            window.location.href = '/';
-        }, 1000);
+        // Add a small delay to ensure token is properly stored
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        window.location.href = '/';
     } catch (error) {
         console.error('Authentication error:', error);
         displayErrorMessage('Authentication failed. Please try again.');
+        // Force logout on auth failure
+        await handleLogout();
+    } finally {
+        hideLoading();
     }
 }
 
-// Handle Google Authentication
-async function handleGoogleAuth(isSignUp = false) {
-    const provider = new GoogleAuthProvider();
+async function handleEmailSignIn(email, password) {
     try {
-        const result = await signInWithPopup(auth, provider);
-        const user = result.user;
+        showLoading();
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        await handleAuthSuccess(userCredential.user, false);
+    } catch (error) {
+        console.error('Login error:', error);
+        displayErrorMessage(getAuthErrorMessage(error.code));
+    } finally {
+        hideLoading();
+    }
+}
+
+async function handleEmailSignUp(email, password, firstname) {
+    try {
+        showLoading();
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
         
-        // Check if this is a new user
+        // Additional user data
+        await setDoc(doc(db, "users", user.uid), {
+            firstname: firstname,
+            email: email,
+            createdAt: new Date().toISOString(),
+            lastLogin: new Date().toISOString()
+        });
+        
+        await handleAuthSuccess(user, true);
+    } catch (error) {
+        console.error('Signup error:', error);
+        displayErrorMessage(getAuthErrorMessage(error.code));
+    } finally {
+        hideLoading();
+    }
+}
+
+async function handleGoogleAuth(isSignUp = false) {
+    try {
+        showLoading();
+        const result = await signInWithPopup(auth, googleProvider);
+        const user = result.user;
         const isNewUser = result._tokenResponse.isNewUser;
         
         await handleAuthSuccess(user, isNewUser);
     } catch (error) {
-        displayErrorMessage(`Google sign-${isSignUp ? 'up' : 'in'} failed: ${error.message}`);
+        console.error('Google auth error:', error);
+        displayErrorMessage(getAuthErrorMessage(error.code));
+    } finally {
+        hideLoading();
     }
 }
 
-// Document ready event listeners
-document.addEventListener('DOMContentLoaded', () => {
-    // Handle signup link on login page
-    const signupLink = document.querySelector('a[href="/signup"]');
-    if (signupLink) {
-        signupLink.addEventListener('click', (e) => {
-            e.preventDefault();
-            window.location.href = '/signup';
+async function handleLogout() {
+    try {
+        showLoading();
+        await signOut(auth);
+        // Clear session on backend
+        await fetch('/api/auth/logout', {
+            method: 'POST',
+            credentials: 'include'
         });
+        window.location.href = '/login';
+    } catch (error) {
+        console.error('Logout error:', error);
+        displayErrorMessage("Logout failed: " + error.message);
+    } finally {
+        hideLoading();
     }
+}
 
-    // Handle login form
+// Event Listeners
+document.addEventListener('DOMContentLoaded', () => {
+    // Login Form Handler
     const loginForm = document.getElementById("loginForm");
     if (loginForm) {
         loginForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const email = document.getElementById("email").value;
             const password = document.getElementById("password").value;
-
-            try {
-                const userCredential = await signInWithEmailAndPassword(auth, email, password);
-                await handleAuthSuccess(userCredential.user, false);
-            } catch (error) {
-                displayErrorMessage("Login failed: " + error.message);
-            }
+            await handleEmailSignIn(email, password);
         });
 
-        // Google Login handler
+        // Google Login Button
         const googleLoginButton = document.getElementById("google-login");
         if (googleLoginButton) {
             googleLoginButton.addEventListener('click', () => handleGoogleAuth(false));
         }
     }
 
-    // Handle signup form
+    // Signup Form Handler
     const signUpForm = document.getElementById("signupForm");
     if (signUpForm) {
         signUpForm.addEventListener('submit', async (e) => {
@@ -159,85 +262,55 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            try {
-                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-                const user = userCredential.user;
-
-                // Save user info to Firestore
-                await setDoc(doc(db, "users", user.uid), {
-                    firstname: firstname,
-                    email: email,
-                    createdAt: new Date().toISOString()
-                });
-
-                await handleAuthSuccess(user, true);
-            } catch (error) {
-                displayErrorMessage("Sign-up failed: " + error.message);
-            }
+            await handleEmailSignUp(email, password, firstname);
         });
 
-        // Google Sign-up handler
+        // Google Sign-up Button
         const googleSignUpButton = document.getElementById("google-signup");
         if (googleSignUpButton) {
             googleSignUpButton.addEventListener('click', () => handleGoogleAuth(true));
         }
     }
+
+    // Logout Button
+    const logoutButton = document.getElementById("logout");
+    if (logoutButton) {
+        logoutButton.addEventListener('click', async (e) => {
+            e.preventDefault();
+            await handleLogout();
+        });
+    }
 });
 
-// Logout handler
-async function handleLogout() {
-    try {
-        await auth.signOut();
-        // Clear session on backend
-        await fetch('/logout', {
-            method: 'GET',
-            credentials: 'include'
-        });
-        window.location.href = '/login';
-    } catch (error) {
-        console.error('Logout error:', error);
-        displayErrorMessage("Logout failed: " + error.message);
-    }
-}
-
-// Authentication state observer
+// Authentication State Observer
 onAuthStateChanged(auth, async (user) => {
     const signUpButton = document.getElementById("sign-up-btn");
     const profilePic = document.getElementById("profile-pic");
     const profileName = document.getElementById("profile-name");
     const profileEmail = document.getElementById("profile-email");
-    const logoutButton = document.getElementById("logout");
+    const authElements = document.querySelectorAll('.auth-required');
+    const noAuthElements = document.querySelectorAll('.no-auth-required');
     
     if (user) {
-        // User is signed in
         try {
+            // User is signed in
             const token = await user.getIdToken();
             await verifyTokenWithBackend(token);
             
+            // Update UI elements
             if (signUpButton) signUpButton.style.display = "none";
             if (profilePic) {
                 profilePic.style.display = "block";
-                profilePic.src = user.photoURL || 'a.jpeg';
+                profilePic.src = user.photoURL || '/static/images/default-avatar.png';
                 profilePic.addEventListener('click', toggleDropdown);
             }
-            
             if (profileName) profileName.textContent = user.displayName || user.email.split('@')[0];
             if (profileEmail) profileEmail.textContent = user.email;
-            if (logoutButton) {
-                logoutButton.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    handleLogout();
-                });
-            }
-
-            // Update UI for authenticated state
-            document.querySelectorAll('.auth-required').forEach(elem => {
-                elem.style.display = 'block';
-            });
-            document.querySelectorAll('.no-auth-required').forEach(elem => {
-                elem.style.display = 'none';
-            });
-
+            
+            // Show/hide authenticated elements
+            authElements.forEach(elem => elem.style.display = 'block');
+            noAuthElements.forEach(elem => elem.style.display = 'none');
+            
         } catch (error) {
             console.error('Token verification error:', error);
             await handleLogout();
@@ -247,14 +320,10 @@ onAuthStateChanged(auth, async (user) => {
         if (signUpButton) signUpButton.style.display = "block";
         if (profilePic) profilePic.style.display = "none";
         
-        // Update UI for non-authenticated state
-        document.querySelectorAll('.auth-required').forEach(elem => {
-            elem.style.display = 'none';
-        });
-        document.querySelectorAll('.no-auth-required').forEach(elem => {
-            elem.style.display = 'block';
-        });
-
+        // Show/hide non-authenticated elements
+        authElements.forEach(elem => elem.style.display = 'none');
+        noAuthElements.forEach(elem => elem.style.display = 'block');
+        
         // Redirect to login if on protected page
         const protectedPaths = ['/', '/index.html'];
         if (protectedPaths.includes(window.location.pathname)) {
@@ -263,7 +332,7 @@ onAuthStateChanged(auth, async (user) => {
     }
 });
 
-// Dropdown toggle function
+// UI Utilities
 function toggleDropdown() {
     const dropdown = document.getElementById('profile-dropdown');
     if (dropdown) {
@@ -283,4 +352,11 @@ window.addEventListener('click', (event) => {
     }
 });
 
-export { handleLogout };
+// Export necessary functions
+export {
+    handleLogout,
+    handleEmailSignIn,
+    handleEmailSignUp,
+    handleGoogleAuth,
+    auth
+};
