@@ -1,6 +1,15 @@
-// Import the necessary Firebase modules
+// firebaseauth.js
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js';
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js';
+import { 
+    getAuth, 
+    createUserWithEmailAndPassword, 
+    signInWithEmailAndPassword, 
+    signInWithPopup, 
+    GoogleAuthProvider, 
+    onAuthStateChanged,
+    setPersistence,
+    browserLocalPersistence
+} from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js';
 import { getFirestore, doc, setDoc, getDoc } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js';
 
 // Firebase configuration
@@ -19,7 +28,12 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// Function to display error messages
+// Set persistence to LOCAL
+setPersistence(auth, browserLocalPersistence).catch((error) => {
+    console.error("Persistence error:", error);
+});
+
+// Error message display function
 function displayErrorMessage(message) {
     const errorMessage = document.getElementById("error-message");
     if (errorMessage) {
@@ -31,7 +45,7 @@ function displayErrorMessage(message) {
     }
 }
 
-// Function to display success messages
+// Success message display function
 function displaySuccessMessage(message) {
     const successMessage = document.getElementById("success-message");
     if (successMessage) {
@@ -43,20 +57,21 @@ function displaySuccessMessage(message) {
     }
 }
 
-// Function to verify token with backend
+// Token verification with backend
 async function verifyTokenWithBackend(token) {
     try {
         const response = await fetch('/verify-token', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
             },
-            body: JSON.stringify({ token: token }),
-            credentials: 'include'
+            credentials: 'include',
+            body: JSON.stringify({ token })
         });
         
         if (!response.ok) {
-            throw new Error('Token verification failed');
+            throw new Error(`Token verification failed: ${response.statusText}`);
         }
         
         return await response.json();
@@ -66,45 +81,47 @@ async function verifyTokenWithBackend(token) {
     }
 }
 
-// Handle successful authentication
+// Authentication success handler
 async function handleAuthSuccess(user, isNewUser = false) {
     try {
-        const token = await user.getIdToken();
+        const token = await user.getIdToken(true);
+        
+        // Verify token with backend
         await verifyTokenWithBackend(token);
         
         if (isNewUser) {
-            // For new users, ensure we have their data in Firestore
-            const userDoc = await getDoc(doc(db, "users", user.uid));
-            if (!userDoc.exists()) {
-                await setDoc(doc(db, "users", user.uid), {
-                    firstname: user.displayName || user.email.split('@')[0],
-                    email: user.email,
-                    createdAt: new Date().toISOString()
-                });
-            }
+            // Save new user data to Firestore
+            await setDoc(doc(db, "users", user.uid), {
+                firstname: user.displayName || user.email.split('@')[0],
+                email: user.email,
+                createdAt: new Date().toISOString()
+            });
         }
         
         displaySuccessMessage("Authentication successful! Redirecting...");
+        
+        // Set a small delay before redirect
         setTimeout(() => {
             window.location.href = '/';
-        }, 1000);
+        }, 1500);
     } catch (error) {
         console.error('Authentication error:', error);
-        displayErrorMessage('Authentication failed. Please try again.');
+        displayErrorMessage(`Authentication failed: ${error.message}`);
+        await auth.signOut();
     }
 }
 
-// Handle Google Authentication
+// Google Authentication handler
 async function handleGoogleAuth(isSignUp = false) {
     const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({
+        prompt: 'select_account'
+    });
+    
     try {
         const result = await signInWithPopup(auth, provider);
-        const user = result.user;
-        
-        // Check if this is a new user
         const isNewUser = result._tokenResponse.isNewUser;
-        
-        await handleAuthSuccess(user, isNewUser);
+        await handleAuthSuccess(result.user, isNewUser);
     } catch (error) {
         displayErrorMessage(`Google sign-${isSignUp ? 'up' : 'in'} failed: ${error.message}`);
     }
@@ -112,16 +129,7 @@ async function handleGoogleAuth(isSignUp = false) {
 
 // Document ready event listeners
 document.addEventListener('DOMContentLoaded', () => {
-    // Handle signup link on login page
-    const signupLink = document.querySelector('a[href="/signup"]');
-    if (signupLink) {
-        signupLink.addEventListener('click', (e) => {
-            e.preventDefault();
-            window.location.href = '/signup';
-        });
-    }
-
-    // Handle login form
+    // Login form handler
     const loginForm = document.getElementById("loginForm");
     if (loginForm) {
         loginForm.addEventListener('submit', async (e) => {
@@ -133,18 +141,32 @@ document.addEventListener('DOMContentLoaded', () => {
                 const userCredential = await signInWithEmailAndPassword(auth, email, password);
                 await handleAuthSuccess(userCredential.user, false);
             } catch (error) {
-                displayErrorMessage("Login failed: " + error.message);
+                let errorMessage = "Login failed: ";
+                switch (error.code) {
+                    case 'auth/wrong-password':
+                        errorMessage += "Invalid password. Please try again.";
+                        break;
+                    case 'auth/user-not-found':
+                        errorMessage += "No account found with this email.";
+                        break;
+                    case 'auth/invalid-email':
+                        errorMessage += "Invalid email format.";
+                        break;
+                    default:
+                        errorMessage += error.message;
+                }
+                displayErrorMessage(errorMessage);
             }
         });
 
-        // Google Login handler
+        // Google Login button
         const googleLoginButton = document.getElementById("google-login");
         if (googleLoginButton) {
             googleLoginButton.addEventListener('click', () => handleGoogleAuth(false));
         }
     }
 
-    // Handle signup form
+    // Signup form handler
     const signUpForm = document.getElementById("signupForm");
     if (signUpForm) {
         signUpForm.addEventListener('submit', async (e) => {
@@ -161,22 +183,29 @@ document.addEventListener('DOMContentLoaded', () => {
 
             try {
                 const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-                const user = userCredential.user;
-
-                // Save user info to Firestore
-                await setDoc(doc(db, "users", user.uid), {
-                    firstname: firstname,
-                    email: email,
+                await setDoc(doc(db, "users", userCredential.user.uid), {
+                    firstname,
+                    email,
                     createdAt: new Date().toISOString()
                 });
-
-                await handleAuthSuccess(user, true);
+                await handleAuthSuccess(userCredential.user, true);
             } catch (error) {
-                displayErrorMessage("Sign-up failed: " + error.message);
+                let errorMessage = "Sign-up failed: ";
+                switch (error.code) {
+                    case 'auth/email-already-in-use':
+                        errorMessage += "This email is already registered.";
+                        break;
+                    case 'auth/weak-password':
+                        errorMessage += "Password should be at least 6 characters.";
+                        break;
+                    default:
+                        errorMessage += error.message;
+                }
+                displayErrorMessage(errorMessage);
             }
         });
 
-        // Google Sign-up handler
+        // Google Signup button
         const googleSignUpButton = document.getElementById("google-signup");
         if (googleSignUpButton) {
             googleSignUpButton.addEventListener('click', () => handleGoogleAuth(true));
@@ -188,9 +217,8 @@ document.addEventListener('DOMContentLoaded', () => {
 async function handleLogout() {
     try {
         await auth.signOut();
-        // Clear session on backend
         await fetch('/logout', {
-            method: 'GET',
+            method: 'POST',
             credentials: 'include'
         });
         window.location.href = '/login';
@@ -200,54 +228,26 @@ async function handleLogout() {
     }
 }
 
-// Authentication state observer
+// Auth state observer
 onAuthStateChanged(auth, async (user) => {
-    const signUpButton = document.getElementById("sign-up-btn");
-    const profilePic = document.getElementById("profile-pic");
-    const profileName = document.getElementById("profile-name");
-    const profileEmail = document.getElementById("profile-email");
-    const logoutButton = document.getElementById("logout");
-    
     if (user) {
-        // User is signed in
         try {
-            const token = await user.getIdToken();
+            const token = await user.getIdToken(true);
             await verifyTokenWithBackend(token);
             
-            if (signUpButton) signUpButton.style.display = "none";
-            if (profilePic) {
-                profilePic.style.display = "block";
-                profilePic.src = user.photoURL || 'a.jpeg';
-                profilePic.addEventListener('click', toggleDropdown);
-            }
-            
-            if (profileName) profileName.textContent = user.displayName || user.email.split('@')[0];
-            if (profileEmail) profileEmail.textContent = user.email;
-            if (logoutButton) {
-                logoutButton.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    handleLogout();
-                });
-            }
-
-            // Update UI for authenticated state
+            // Update UI elements for authenticated state
             document.querySelectorAll('.auth-required').forEach(elem => {
                 elem.style.display = 'block';
             });
             document.querySelectorAll('.no-auth-required').forEach(elem => {
                 elem.style.display = 'none';
             });
-
         } catch (error) {
-            console.error('Token verification error:', error);
+            console.error('Auth state error:', error);
             await handleLogout();
         }
     } else {
-        // User is signed out
-        if (signUpButton) signUpButton.style.display = "block";
-        if (profilePic) profilePic.style.display = "none";
-        
-        // Update UI for non-authenticated state
+        // Update UI elements for non-authenticated state
         document.querySelectorAll('.auth-required').forEach(elem => {
             elem.style.display = 'none';
         });
@@ -255,31 +255,11 @@ onAuthStateChanged(auth, async (user) => {
             elem.style.display = 'block';
         });
 
-        // Redirect to login if on protected page
+        // Redirect if on protected page
         const protectedPaths = ['/', '/index.html'];
         if (protectedPaths.includes(window.location.pathname)) {
             window.location.href = '/login';
         }
-    }
-});
-
-// Dropdown toggle function
-function toggleDropdown() {
-    const dropdown = document.getElementById('profile-dropdown');
-    if (dropdown) {
-        dropdown.classList.toggle('show');
-    }
-}
-
-// Close dropdown when clicking outside
-window.addEventListener('click', (event) => {
-    if (!event.target.matches('#profile-pic')) {
-        const dropdowns = document.getElementsByClassName('profile-dropdown');
-        Array.from(dropdowns).forEach(dropdown => {
-            if (dropdown.classList.contains('show')) {
-                dropdown.classList.remove('show');
-            }
-        });
     }
 });
 
