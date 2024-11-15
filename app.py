@@ -13,6 +13,7 @@ from pydub import AudioSegment
 import whisper
 import tempfile
 from dotenv import load_dotenv
+from werkzeug.utils import secure_filename 
 
 # Load environment variables
 load_dotenv()
