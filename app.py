@@ -24,7 +24,7 @@ firebase_admin.initialize_app(cred, {'storageBucket': 'imagetotext-4c3e3.appspot
 db = firestore.client()
 
 # Initialize Whisper model
-model = whisper.load_model("base")
+model = whisper.load_model("tiny")
 
 # Login required decorator
 def login_required(f):
