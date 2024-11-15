@@ -3,6 +3,7 @@ import os
 import json
 import secrets
 import tempfile
+import logging
 from flask_cors import CORS
 from functools import wraps
 import firebase_admin
@@ -10,9 +11,15 @@ from firebase_admin import credentials, auth, storage, firestore
 from pydub import AudioSegment
 import whisper
 
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 app.secret_key = secrets.token_hex(24)
+# Increase session lifetime
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=5)
 CORS(app, supports_credentials=True)
 
 # Initialize Firebase Admin SDK from environment variable
@@ -26,29 +33,25 @@ db = firestore.client()
 # Initialize Whisper model
 model = whisper.load_model("tiny")
 
-# Login required decorator
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_token' not in session:
-            return redirect(url_for('login'))
+            logger.warning("No user_token in session")
+            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
+        
         try:
             decoded_token = auth.verify_id_token(session['user_token'])
             session['user_id'] = decoded_token['uid']
+            # Make session permanent
+            session.permanent = True
         except Exception as e:
-            print(f"Auth error: {e}")
-            return redirect(url_for('login'))
+            logger.error(f"Auth error: {e}")
+            session.clear()
+            return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
+            
         return f(*args, **kwargs)
     return decorated_function
-
-@app.route('/')
-@login_required
-def index():
-    return render_template('index.html')
-
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
 
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
@@ -58,6 +61,12 @@ def signup():
             email = data.get('email')
             password = data.get('password')
             firstname = data.get('firstname')
+
+            if not all([email, password, firstname]):
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Missing required fields'
+                }), 400
 
             # Create user in Firebase
             user = auth.create_user(
@@ -73,16 +82,27 @@ def signup():
                 'createdAt': firestore.SERVER_TIMESTAMP
             })
 
-            # Create custom token
+            # Create ID token
             custom_token = auth.create_custom_token(user.uid)
             
+            # Set session data
+            session['user_token'] = custom_token.decode()
+            session['user_id'] = user.uid
+            session.permanent = True
+
             return jsonify({
                 'status': 'success',
                 'message': 'User created successfully',
-                'token': custom_token.decode()
+                'token': custom_token.decode(),
+                'user': {
+                    'uid': user.uid,
+                    'email': email,
+                    'firstname': firstname
+                }
             })
 
         except Exception as e:
+            logger.error(f"Signup error: {e}")
             return jsonify({
                 'status': 'error',
                 'message': str(e)
@@ -90,67 +110,10 @@ def signup():
 
     return render_template('signup.html')
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        try:
-            data = request.json
-            email = data.get('email')
-            password = data.get('password')
-
-            # Verify user credentials (you'll need to implement this)
-            user = auth.get_user_by_email(email)
-            custom_token = auth.create_custom_token(user.uid)
-            
-            return jsonify({
-                'status': 'success',
-                'token': custom_token.decode()
-            })
-
-        except Exception as e:
-            return jsonify({
-                'status': 'error',
-                'message': str(e)
-            }), 401
-
-    return render_template('login.html')
-
-@app.route('/verify-token', methods=['POST'])
-def verify_token():
-    try:
-        data = request.get_json()
-        if not data or 'token' not in data:
-            return jsonify({'status': 'error', 'message': 'No token provided'}), 400
-        
-        token = data.get('token')
-        decoded_token = auth.verify_id_token(token)
-        session['user_token'] = token
-        session['user_id'] = decoded_token['uid']
-        return jsonify({'status': 'success', 'uid': decoded_token['uid']})
-    except Exception as e:
-        print(f"Token verification error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 401
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_audio():
     try:
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "No authorization token provided"}), 401
-        
-        token = auth_header.split(' ')[1]
-        try:
-            decoded_token = auth.verify_id_token(token)
-            user_id = decoded_token['uid']
-        except Exception as e:
-            return jsonify({"error": "Invalid authorization token"}), 401
-
         if 'audio_file' not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
 
@@ -158,39 +121,57 @@ def upload_audio():
         if audio_file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        # Use a temporary file for audio processing
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-            audio_file.save(temp_audio_file.name)
-            wav_path = temp_audio_file.name
-
-        # Convert if MP3, otherwise use as-is
+        # Create temp directory if it doesn't exist
+        temp_dir = tempfile.mkdtemp()
+        
         try:
-            if audio_file.filename.lower().endswith('.mp3'):
-                audio = AudioSegment.from_mp3(wav_path)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as converted_file:
-                    audio.export(converted_file.name, format='wav')
-                    wav_path = converted_file.name
+            # Save uploaded file
+            temp_input_path = os.path.join(temp_dir, "input_audio")
+            audio_file.save(temp_input_path)
+            
+            # Convert audio if needed
+            temp_wav_path = os.path.join(temp_dir, "converted.wav")
+            
+            try:
+                if audio_file.filename.lower().endswith('.mp3'):
+                    logger.debug("Converting MP3 to WAV")
+                    audio = AudioSegment.from_mp3(temp_input_path)
+                    audio.export(temp_wav_path, format='wav')
+                else:
+                    # Copy the file if it's already WAV
+                    logger.debug("Using original WAV file")
+                    os.rename(temp_input_path, temp_wav_path)
 
-            result = model.transcribe(wav_path)
-            transcription = result['text']
+                logger.debug("Starting transcription")
+                result = model.transcribe(temp_wav_path)
+                transcription = result['text']
+                
+                logger.debug(f"Transcription successful: {transcription[:50]}...")
+                
+                return jsonify({
+                    "transcription": transcription,
+                    "status": "success"
+                })
 
+            except Exception as e:
+                logger.error(f"Error during audio processing: {str(e)}")
+                return jsonify({
+                    "error": f"Error processing audio: {str(e)}",
+                    "status": "error"
+                }), 500
+
+        finally:
             # Clean up temporary files
-            os.remove(wav_path)
-
-            return jsonify({
-                "transcription": transcription,
-                "status": "success"
-            })
-
-        except Exception as e:
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-            return jsonify({"error": f"Error processing audio: {str(e)}", "status": "error"}), 500
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                logger.error(f"Error cleaning up temp files: {e}")
 
     except Exception as e:
-        print(f"Error processing audio: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return jsonify({
-            "error": f"Error processing audio: {str(e)}",
+            "error": "An unexpected error occurred",
             "status": "error"
         }), 500
 
