@@ -38,7 +38,7 @@ db = firestore.client()
 
 # Initialize Whisper model with error handling
 try:
-    model = whisper.load_model("base")  # Changed from "tiny" to "base"
+    model = whisper.load_model("tiny")  # Changed from "tiny" to "base"
 except Exception as e:
     print(f"Error loading Whisper model: {e}")
     model = None
