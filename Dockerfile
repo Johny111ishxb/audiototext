@@ -1,4 +1,5 @@
-FROM python:3.9-slim
+# Use a larger base image with more memory available
+FROM python:3.9
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,7 +13,7 @@ WORKDIR /app
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Install Python packages
+# Install Python packages with optimized settings
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application
@@ -21,12 +22,24 @@ COPY . .
 # Set environment variables
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
-ENV GUNICORN_TIMEOUT=300
+ENV GUNICORN_TIMEOUT=600
 ENV GUNICORN_WORKERS=1
-ENV GUNICORN_THREADS=4
+ENV GUNICORN_THREADS=1
+ENV PYTORCH_NO_CUDA=1
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
 
 # Expose the port the app runs on
 EXPOSE 8000
 
-# Use gunicorn with optimized settings
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT --timeout $GUNICORN_TIMEOUT --workers $GUNICORN_WORKERS --threads $GUNICORN_THREADS --log-level info app:app"]
+# Use gunicorn with worker configuration optimized for memory-intensive tasks
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT \
+    --timeout $GUNICORN_TIMEOUT \
+    --workers $GUNICORN_WORKERS \
+    --threads $GUNICORN_THREADS \
+    --worker-class=gthread \
+    --worker-tmp-dir=/dev/shm \
+    --log-level info \
+    --max-requests 1 \
+    --max-requests-jitter 0 \
+    app:app"]
