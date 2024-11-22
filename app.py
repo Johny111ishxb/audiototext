@@ -14,6 +14,15 @@ import whisper
 import tempfile
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename 
+import gc
+import torch
+import numpy as np
+from pydub.utils import make_chunks
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -37,12 +46,55 @@ firebase_admin.initialize_app(cred, {
 # Initialize Firestore
 db = firestore.client()
 
-# Initialize Whisper model with error handling
-try:
-    model = whisper.load_model("tiny")
-except Exception as e:
-    print(f"Error loading Whisper model: {e}")
-    model = None
+# Global variable for Whisper model
+model = None
+
+def initialize_whisper():
+    """Initialize Whisper model with memory optimizations"""
+    global model
+    if model is None:
+        try:
+            # Set PyTorch memory optimizations
+            torch.set_num_threads(1)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Load the smallest model variant
+            model = whisper.load_model("tiny", device="cpu", download_root="/tmp")
+            
+            # Force model to use FP32
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad = False
+        except Exception as e:
+            logger.error(f"Error loading Whisper model: {e}")
+            return False
+    return True
+
+def cleanup_memory():
+    """Force garbage collection and clear CUDA cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+def process_audio_chunk(chunk, temp_dir):
+    """Process a single chunk of audio"""
+    try:
+        # Export chunk to temporary WAV file
+        chunk_path = os.path.join(temp_dir, "chunk.wav")
+        chunk.export(chunk_path, format='wav')
+        
+        # Transcribe chunk
+        result = model.transcribe(chunk_path, fp16=False)
+        
+        # Clean up
+        os.remove(chunk_path)
+        cleanup_memory()
+        
+        return result.get('text', '').strip()
+    except Exception as e:
+        logger.error(f"Error processing chunk: {e}")
+        return ''
 
 def login_required(f):
     @wraps(f)
@@ -53,129 +105,28 @@ def login_required(f):
             decoded_token = auth.verify_id_token(session['user_token'])
             session['user_id'] = decoded_token['uid']
         except Exception as e:
-            print(f"Auth error: {e}")
+            logger.error(f"Auth error: {e}")
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
 
 @app.route('/health')
 def health_check():
-    return jsonify({"status": "healthy"}), 200
+    return jsonify({"status": "healthy", "memory_usage": f"{psutil.Process().memory_info().rss / 1024 / 1024:.2f}MB"}), 200
 
 @app.route('/')
 @login_required
 def index():
     return render_template('index.html')
 
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        try:
-            data = request.json
-            email = data.get('email')
-            password = data.get('password')
-            firstname = data.get('firstname')
-
-            if not all([email, password, firstname]):
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Missing required fields'
-                }), 400
-
-            # Create user in Firebase
-            user = auth.create_user(
-                email=email,
-                password=password,
-                display_name=firstname
-            )
-
-            # Create user document in Firestore
-            db.collection('users').document(user.uid).set({
-                'firstname': firstname,
-                'email': email,
-                'createdAt': firestore.SERVER_TIMESTAMP
-            })
-
-            # Create custom token
-            custom_token = auth.create_custom_token(user.uid)
-            
-            return jsonify({
-                'status': 'success',
-                'message': 'User created successfully',
-                'token': custom_token.decode()
-            })
-
-        except Exception as e:
-            return jsonify({
-                'status': 'error',
-                'message': str(e)
-            }), 400
-
-    return render_template('signup.html')
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        try:
-            data = request.json
-            email = data.get('email')
-            password = data.get('password')
-
-            if not all([email, password]):
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Missing email or password'
-                }), 400
-
-            # Get user and create custom token
-            user = auth.get_user_by_email(email)
-            custom_token = auth.create_custom_token(user.uid)
-            
-            return jsonify({
-                'status': 'success',
-                'token': custom_token.decode()
-            })
-
-        except Exception as e:
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid credentials'
-            }), 401
-
-    return render_template('login.html')
-
-@app.route('/verify-token', methods=['POST'])
-def verify_token():
-    try:
-        data = request.get_json()
-        if not data or 'token' not in data:
-            return jsonify({'status': 'error', 'message': 'No token provided'}), 400
-        
-        token = data.get('token')
-        decoded_token = auth.verify_id_token(token)
-        session['user_token'] = token
-        session['user_id'] = decoded_token['uid']
-        return jsonify({'status': 'success', 'uid': decoded_token['uid']})
-    except Exception as e:
-        print(f"Token verification error: {e}")
-        return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_audio():
-    if not model:
-        return jsonify({"error": "Whisper model not initialized"}), 500
+    if not initialize_whisper():
+        return jsonify({"error": "Could not initialize Whisper model"}), 500
 
     try:
+        # Verify authentication
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"error": "No authorization token provided"}), 401
@@ -194,46 +145,62 @@ def upload_audio():
         if audio_file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        # Create temporary directory using tempfile
+        # Process audio in chunks
         with tempfile.TemporaryDirectory() as temp_dir:
+            # Save uploaded file
             temp_path = os.path.join(temp_dir, secure_filename(audio_file.filename))
             audio_file.save(temp_path)
             
             try:
+                # Load audio file
                 if audio_file.filename.lower().endswith('.mp3'):
                     audio = AudioSegment.from_mp3(temp_path)
-                    wav_path = os.path.join(temp_dir, "converted.wav")
-                    audio.export(wav_path, format='wav')
                 else:
-                    wav_path = temp_path
+                    audio = AudioSegment.from_wav(temp_path)
 
-                result = model.transcribe(wav_path)
-                transcription = result['text']
+                # Remove original file to free memory
+                os.remove(temp_path)
+
+                # Split audio into 30-second chunks
+                chunk_length = 30 * 1000  # 30 seconds
+                chunks = make_chunks(audio, chunk_length)
+
+                # Process chunks and combine transcriptions
+                transcriptions = []
+                for chunk in chunks:
+                    transcript = process_audio_chunk(chunk, temp_dir)
+                    if transcript:
+                        transcriptions.append(transcript)
+                    cleanup_memory()
+
+                final_transcription = ' '.join(transcriptions)
 
                 # Store transcription in Firestore
                 doc_ref = db.collection('transcriptions').document()
                 doc_ref.set({
                     'user_id': user_id,
-                    'transcription': transcription,
+                    'transcription': final_transcription,
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'filename': audio_file.filename
                 })
 
+                cleanup_memory()
+
                 return jsonify({
-                    "transcription": transcription,
+                    "transcription": final_transcription,
                     "status": "success",
                     "document_id": doc_ref.id
                 })
 
             except Exception as e:
-                print(f"Transcription error: {e}")
+                logger.error(f"Transcription error: {e}")
                 return jsonify({
                     "error": "Error processing audio file",
                     "status": "error"
                 }), 500
 
     except Exception as e:
-        print(f"Error processing audio: {str(e)}")
+        logger.error(f"Error processing audio: {str(e)}")
         return jsonify({
             "error": f"Error processing audio: {str(e)}",
             "status": "error"
