@@ -18,6 +18,8 @@ import gc
 import torch
 import logging
 from threading import Lock
+import numpy as np
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,37 +47,64 @@ firebase_admin.initialize_app(cred, {
 # Initialize Firestore
 db = firestore.client()
 
-# Global lock for synchronizing model usage
-model_lock = Lock()
+# Global variables
 model = None
-
-def initialize_model():
-    """Initialize the Whisper model with memory-optimized settings."""
-    global model
-    try:
-        # Set PyTorch to use the most memory-efficient settings
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-        torch.backends.cudnn.enabled = False
-        
-        # Load the smallest possible model
-        if model is None:
-            model = whisper.load_model("tiny", device="cpu", download_root="/tmp")
-            # Force model to use FP32
-            model.eval()
-            for param in model.parameters():
-                param.requires_grad = False
-    except Exception as e:
-        logger.error(f"Error loading Whisper model: {e}")
-        model = None
-    
-    return model
+model_lock = Lock()
+CHUNK_DURATION = 10000  # 10 seconds
+MAX_AUDIO_LENGTH = 300000  # 5 minutes
+MODEL_NAME = "tiny"
 
 def cleanup_memory():
-    """Force garbage collection and clear CUDA cache if available."""
-    gc.collect()
+    """Aggressive memory cleanup"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    gc.collect()
+    if 'model' in globals():
+        global model
+        model = None
+    gc.collect()
+
+def lazy_load_model():
+    """Lazy load the model only when needed"""
+    global model
+    if model is None:
+        try:
+            # Set memory-efficient PyTorch settings
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            torch.backends.cudnn.enabled = False
+            
+            # Create cache directory if it doesn't exist
+            cache_dir = Path("/tmp/whisper_cache")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Load model with minimal memory footprint
+            model = whisper.load_model(
+                MODEL_NAME,
+                device="cpu",
+                download_root=str(cache_dir),
+                in_memory=False
+            )
+            
+            # Force model to use less memory
+            model.eval()
+            torch.set_grad_enabled(False)
+            
+            for param in model.parameters():
+                param.requires_grad = False
+                if hasattr(param, 'grad'):
+                    param.grad = None
+                    
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            cleanup_memory()
+            raise
+
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    import psutil
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
 
 def login_required(f):
     @wraps(f)
@@ -91,15 +120,146 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def process_audio_chunk(audio_segment):
+    """Process a single audio chunk"""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_wav:
+            audio_segment.export(temp_wav.name, format='wav')
+            
+            with model_lock:
+                lazy_load_model()
+                if model is None:
+                    raise Exception("Failed to load model")
+                
+                result = model.transcribe(
+                    temp_wav.name,
+                    fp16=False,
+                    language='en',
+                    task='transcribe'
+                )
+                
+            return result.get('text', '').strip()
+    except Exception as e:
+        logger.error(f"Error processing chunk: {e}")
+        raise
+    finally:
+        cleanup_memory()
+
+def split_audio(audio_segment, max_chunk_size=CHUNK_DURATION):
+    """Split audio into smaller chunks"""
+    chunks = []
+    for i in range(0, len(audio_segment), max_chunk_size):
+        chunk = audio_segment[i:i + max_chunk_size]
+        chunks.append(chunk)
+    return chunks
+
+@app.route('/upload', methods=['POST'])
+@login_required
+def upload_audio():
+    try:
+        # Check memory usage before starting
+        initial_memory = get_memory_usage()
+        logger.info(f"Initial memory usage: {initial_memory:.2f}MB")
+
+        # Verify authorization
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "No authorization token provided"}), 401
+        
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            user_id = decoded_token['uid']
+        except Exception as e:
+            return jsonify({"error": "Invalid authorization token"}), 401
+
+        if 'audio_file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        audio_file = request.files['audio_file']
+        if audio_file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+
+        # Process the audio file
+        try:
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(audio_file.filename)[1], delete=True) as temp_file:
+                audio_file.save(temp_file.name)
+                
+                # Load audio with memory-efficient settings
+                audio = AudioSegment.from_file(
+                    temp_file.name,
+                    format=os.path.splitext(audio_file.filename)[1].lstrip('.')
+                )
+
+                # Check audio length
+                if len(audio) > MAX_AUDIO_LENGTH:
+                    return jsonify({
+                        "error": "Audio file too long. Maximum length is 5 minutes.",
+                        "status": "error"
+                    }), 400
+
+                # Process audio in chunks
+                chunks = split_audio(audio)
+                transcription_parts = []
+
+                for i, chunk in enumerate(chunks):
+                    logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                    try:
+                        text = process_audio_chunk(chunk)
+                        if text:
+                            transcription_parts.append(text)
+                    except Exception as e:
+                        logger.error(f"Error processing chunk {i+1}: {e}")
+                        cleanup_memory()
+                        continue
+
+                transcription = ' '.join(transcription_parts)
+
+                # Store in Firestore
+                doc_ref = db.collection('transcriptions').document()
+                doc_ref.set({
+                    'user_id': user_id,
+                    'transcription': transcription,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'filename': audio_file.filename
+                })
+
+                final_memory = get_memory_usage()
+                logger.info(f"Final memory usage: {final_memory:.2f}MB")
+
+                return jsonify({
+                    "transcription": transcription,
+                    "status": "success",
+                    "document_id": doc_ref.id,
+                    "memory_usage": f"{final_memory:.2f}MB"
+                })
+
+        except Exception as e:
+            logger.error(f"Error processing audio: {e}")
+            cleanup_memory()
+            return jsonify({
+                "error": f"Error processing audio: {str(e)}",
+                "status": "error"
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        cleanup_memory()
+        return jsonify({
+            "error": "An unexpected error occurred",
+            "status": "error"
+        }), 500
+
+    finally:
+        cleanup_memory()
+
+# Routes from previous implementation remain the same
 @app.route('/health')
 def health_check():
-    return jsonify({"status": "healthy", "memory_usage": f"{get_memory_usage():.2f}MB"}), 200
-
-def get_memory_usage():
-    """Get current memory usage in MB."""
-    import psutil
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+    return jsonify({
+        "status": "healthy",
+        "memory_usage": f"{get_memory_usage():.2f}MB"
+    }), 200
 
 @app.route('/')
 @login_required
@@ -203,97 +363,6 @@ def verify_token():
 def logout():
     session.clear()
     return redirect(url_for('login'))
-
-def process_audio_chunk(audio_segment, chunk_duration=30000):
-    """Process audio in chunks to reduce memory usage."""
-    transcription = ""
-    
-    # Split audio into chunks
-    chunks = [audio_segment[i:i+chunk_duration] 
-             for i in range(0, len(audio_segment), chunk_duration)]
-    
-    for chunk in chunks:
-        with tempfile.NamedTemporaryFile(suffix='.wav') as temp_file:
-            chunk.export(temp_file.name, format='wav')
-            with model_lock:
-                if not model:
-                    initialize_model()
-                result = model.transcribe(temp_file.name)
-                transcription += " " + result['text']
-        
-        cleanup_memory()
-    
-    return transcription.strip()
-
-@app.route('/upload', methods=['POST'])
-@login_required
-def upload_audio():
-    try:
-        # Verify authorization
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "No authorization token provided"}), 401
-        
-        token = auth_header.split(' ')[1]
-        try:
-            decoded_token = auth.verify_id_token(token)
-            user_id = decoded_token['uid']
-        except Exception as e:
-            return jsonify({"error": "Invalid authorization token"}), 401
-
-        if 'audio_file' not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        audio_file = request.files['audio_file']
-        if audio_file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
-
-        # Create temporary directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = os.path.join(temp_dir, secure_filename(audio_file.filename))
-            audio_file.save(temp_path)
-            
-            try:
-                # Load audio file
-                if audio_file.filename.lower().endswith('.mp3'):
-                    audio = AudioSegment.from_mp3(temp_path)
-                else:
-                    audio = AudioSegment.from_wav(temp_path)
-
-                # Process audio in chunks
-                transcription = process_audio_chunk(audio)
-
-                # Store transcription in Firestore
-                doc_ref = db.collection('transcriptions').document()
-                doc_ref.set({
-                    'user_id': user_id,
-                    'transcription': transcription,
-                    'timestamp': firestore.SERVER_TIMESTAMP,
-                    'filename': audio_file.filename
-                })
-
-                cleanup_memory()
-
-                return jsonify({
-                    "transcription": transcription,
-                    "status": "success",
-                    "document_id": doc_ref.id,
-                    "memory_usage": f"{get_memory_usage():.2f}MB"
-                })
-
-            except Exception as e:
-                logger.error(f"Transcription error: {e}")
-                return jsonify({
-                    "error": "Error processing audio file",
-                    "status": "error"
-                }), 500
-
-    except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}")
-        return jsonify({
-            "error": f"Error processing audio: {str(e)}",
-            "status": "error"
-        }), 500
 
 # Error handlers
 @app.errorhandler(404)
