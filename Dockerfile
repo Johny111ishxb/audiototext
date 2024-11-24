@@ -1,3 +1,4 @@
+# Use slim base image
 FROM python:3.9-slim
 
 # Install system dependencies
@@ -5,6 +6,8 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
     build-essential \
+    python3-dev \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -13,14 +16,12 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python packages with minimal dependencies
-RUN pip install --no-cache-dir -r requirements.txt \
-    && find /usr/local/lib/python3.9/site-packages -name "*.pyc" -delete \
-    && find /usr/local/lib/python3.9/site-packages -name "__pycache__" -delete
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application
+# Copy application
 COPY . .
 
-# Set extremely aggressive memory optimization environment variables
+# Set aggressive memory optimization environment variables
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 ENV GUNICORN_TIMEOUT=300
@@ -31,18 +32,15 @@ ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV MALLOC_TRIM_THRESHOLD_=100000
 ENV PYTHONMALLOC=malloc
-ENV PYTORCH_CPU_ALLOC_CONF="max_split_size_mb:32"
-ENV WHISPER_CACHE_DIR="/tmp/whisper_cache"
-ENV MPLCONFIGDIR="/tmp"
-ENV TMPDIR="/tmp"
-
-# Create necessary directories
-RUN mkdir -p /tmp/whisper_cache
+ENV PYTORCH_CPU_ALLOC_CONF=max_split_size_mb:32
+ENV TORCH_CPU_ALLOC_CONF=max_split_size_mb:32
+ENV TRANSFORMERS_OFFLINE=1
+ENV TORCH_DISABLE_JIT=1
 
 # Expose port
 EXPOSE 8000
 
-# Use memory-optimized gunicorn settings
+# Run with optimized settings
 CMD ["sh", "-c", "gunicorn \
     --bind 0.0.0.0:$PORT \
     --timeout $GUNICORN_TIMEOUT \
